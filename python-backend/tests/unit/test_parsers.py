@@ -5,6 +5,10 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
+import struct
+import zlib
+
 import pytest
 
 from kiro.parsers import (
@@ -559,6 +563,118 @@ class TestAwsEventStreamParserFeed:
         print(f"Result: {events}")
         # Parser should continue working
         assert len(events) == 1
+
+    def test_reassembles_aws_frame_across_every_transport_boundary(self, aws_event_parser):
+        """AWS frame boundaries, not HTTP chunks, determine one content event."""
+        payload = json.dumps({"content": "你好"}, ensure_ascii=False).encode("utf-8")
+        headers = (
+            bytes([13])
+            + b":message-type"
+            + b"\x07"
+            + struct.pack(">H", 5)
+            + b"event"
+        )
+        prelude = struct.pack(">II", 16 + len(headers) + len(payload), len(headers))
+        message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        message += headers + payload
+        frame = message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+
+        events = []
+        for byte in frame:
+            events.extend(aws_event_parser.feed(bytes([byte])))
+
+        assert events == [{"type": "content", "data": "你好"}]
+
+    def test_preserves_identical_content_in_adjacent_aws_frames(self, aws_event_parser):
+        """Repeated text frames remain repeated deltas at the protocol boundary."""
+        def frame(content: str) -> bytes:
+            payload = json.dumps({"content": content}).encode("utf-8")
+            headers = (
+                bytes([13])
+                + b":message-type"
+                + b"\x07"
+                + struct.pack(">H", 5)
+                + b"event"
+            )
+            prelude = struct.pack(">II", 16 + len(headers) + len(payload), len(headers))
+            message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+            message += headers + payload
+            return message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+
+        events = aws_event_parser.feed(frame("same") + frame("same"))
+
+        assert [event["data"] for event in events] == ["same", "same"]
+
+    def test_rejects_corrupted_aws_frame_crc(self, aws_event_parser):
+        """Corrupted AWS frames fail instead of emitting an invented delta."""
+        payload = b'{"content":"safe"}'
+        headers = (
+            bytes([13])
+            + b":message-type"
+            + b"\x07"
+            + struct.pack(">H", 5)
+            + b"event"
+        )
+        prelude = struct.pack(">II", 16 + len(headers) + len(payload), len(headers))
+        message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        message += headers + payload
+        frame = bytearray(message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF))
+        frame[-1] ^= 0xFF
+
+        with pytest.raises(ValueError, match="CRC"):
+            aws_event_parser.feed(bytes(frame))
+
+    def test_accepts_final_frame_when_its_last_bytes_arrive_later(self, aws_event_parser):
+        """A final HTTP chunk split is buffered until the complete frame arrives."""
+        payload = b'{"content":"final"}'
+        headers = (
+            bytes([13])
+            + b":message-type"
+            + b"\x07"
+            + struct.pack(">H", 5)
+            + b"event"
+        )
+        prelude = struct.pack(">II", 16 + len(headers) + len(payload), len(headers))
+        message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        message += headers + payload
+        frame = message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+
+        assert aws_event_parser.feed(frame[:-1]) == []
+        assert aws_event_parser.feed(frame[-1:]) == [
+            {"type": "content", "data": "final"}
+        ]
+        aws_event_parser.finalize()
+
+    def test_rejects_invalid_lengths_headers_and_utf8_payloads(self, aws_event_parser):
+        """Malformed frame structure never becomes a client-visible text delta."""
+        with pytest.raises(ValueError, match="total length"):
+            aws_event_parser.feed(struct.pack(">II", 8, 0) + b"\x00" * 4)
+        aws_event_parser.reset()
+
+        malformed_headers = b"\x05short"
+        payload = b"{}"
+        prelude = struct.pack(">II", 16 + len(malformed_headers) + len(payload), len(malformed_headers))
+        message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        message += malformed_headers + payload
+        malformed_header_frame = message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+        with pytest.raises(ValueError, match="header name"):
+            aws_event_parser.feed(malformed_header_frame)
+        aws_event_parser.reset()
+
+        utf8_payload = b'{"content":"\xff"}'
+        headers = (
+            bytes([13])
+            + b":message-type"
+            + b"\x07"
+            + struct.pack(">H", 5)
+            + b"event"
+        )
+        prelude = struct.pack(">II", 16 + len(headers) + len(utf8_payload), len(headers))
+        message = prelude + struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        message += headers + utf8_payload
+        invalid_utf8_frame = message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+        with pytest.raises(ValueError, match="UTF-8"):
+            aws_event_parser.feed(invalid_utf8_frame)
 
 
 class TestAwsEventStreamParserToolCalls:

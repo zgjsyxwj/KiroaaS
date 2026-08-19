@@ -2,12 +2,15 @@
 
 """High-level, network-isolated Responses provider tests."""
 
+import asyncio
 import json
 import struct
 from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 import pytest
 import zlib
+from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 
 REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -24,6 +27,14 @@ class StubKiroStream(httpx.AsyncByteStream):
             yield chunk
 
 
+class FailingKiroStream(httpx.AsyncByteStream):
+    """Raise a transport error before the first upstream event."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise httpx.ReadError("prefetch failed")
+        yield b""
+
+
 class KiroResponsesTransport(httpx.AsyncBaseTransport):
     """Capture the Kiro payload and return isolated AWS Event Stream bytes."""
 
@@ -32,6 +43,8 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
         status_code: int = 200,
         error_body: bytes = b"",
         event_batches: Optional[List[List[dict]]] = None,
+        trailing_bytes: bytes = b"",
+        prefetch_failures: int = 0,
     ) -> None:
         """Initialize an isolated Kiro response transport.
 
@@ -45,6 +58,8 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
         self.status_code = status_code
         self.error_body = error_body
         self.event_batches = event_batches
+        self.trailing_bytes = trailing_bytes
+        self.prefetch_failures = prefetch_failures
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.payload = json.loads(request.content)
@@ -55,6 +70,8 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
                 request=request,
                 content=self.error_body or b'{"message":"stub upstream failure"}',
             )
+        if len(self.payloads) <= self.prefetch_failures:
+            return httpx.Response(200, request=request, stream=FailingKiroStream())
         if self.event_batches:
             batch_index = min(len(self.payloads) - 1, len(self.event_batches) - 1)
             events = self.event_batches[batch_index]
@@ -67,7 +84,7 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
                 {"contextUsagePercentage": 10.0},
             ]
         frames = [_aws_event_frame(event) for event in events]
-        wire = b"".join(frames)
+        wire = b"".join(frames) + self.trailing_bytes
         frame_boundaries = {0, len(wire), 5, 17, 31, 47, 63}
         offset = 0
         for frame in frames:
@@ -124,6 +141,16 @@ def _aws_event_frame(payload: dict) -> bytes:
     prelude_crc = struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
     message = prelude + prelude_crc + headers + payload_bytes
     return message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+
+
+def _parse_response_sse(body: bytes) -> List[dict]:
+    """Decode data-only Responses SSE events from an HTTP body."""
+    events: List[dict] = []
+    for record in body.decode("utf-8").split("\n\n"):
+        for line in record.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
 
 
 def _patch_kiro_client(monkeypatch: Any, transport: KiroResponsesTransport) -> None:
@@ -199,6 +226,410 @@ def test_authenticated_responses_flow_uses_kiro_stub_and_formal_output(
     assert array_message["userInputMessage"]["modelId"] == "auto"
     current_message = transport.payload["conversationState"]["currentMessage"]
     assert current_message["userInputMessage"]["content"].endswith("Hello again")
+
+
+def test_responses_stream_emits_one_ordered_text_lifecycle(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Streaming text exposes one complete Responses lifecycle."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {"content": "Hello "},
+                {"content": "world"},
+                {"usage": 1.2},
+                {"contextUsagePercentage": 10.0},
+            ]
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = _parse_response_sse(response.content)
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+
+    response_id = events[0]["response"]["id"]
+    item_id = events[1]["item"]["id"]
+    assert all(event.get("response", {}).get("id", response_id) == response_id for event in events)
+    assert events[2]["item_id"] == item_id
+    assert events[-2]["item"]["id"] == item_id
+    assert events[-1]["response"]["id"] == response_id
+    assert [events[3]["delta"], events[4]["delta"]] == ["Hello ", "world"]
+    assert events[5]["text"] == "Hello world"
+    assert events[-1]["response"]["status"] == "completed"
+
+
+def test_responses_stream_emits_failed_terminal_after_started_stream(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A parser failure after created becomes one failed terminal event."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[[{"content": "partial"}], [{"content": "retry"}]],
+        trailing_bytes=b"\x00" * 12,
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    assert response.status_code == 200
+    events = _parse_response_sse(response.content)
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.failed"
+    assert [event["type"] for event in events].count("response.completed") == 0
+    assert [event["type"] for event in events].count("response.failed") == 1
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert [event["delta"] for event in events if event["type"] == "response.output_text.delta"] == [
+        "partial"
+    ]
+    assert "partial" not in events[-1]["response"]["error"]["message"]
+
+
+def test_responses_stream_empty_upstream_still_has_one_terminal_lifecycle(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """An empty Kiro body completes without inventing an output item."""
+    from main import app
+
+    transport = KiroResponsesTransport(event_batches=[[]])
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    events = _parse_response_sse(response.content)
+    assert response.status_code == 200
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert events[-1]["response"]["output"] == []
+
+
+def test_responses_stream_preserves_function_call_lifecycle_and_call_id(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A streamed Client Tool Call retains its registered identity and arguments."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "lookup",
+                    "toolUseId": "call-stream-1",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                },
+                {"usage": 1.0},
+            ]
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": "Look it up",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        },
+    )
+
+    events = _parse_response_sse(response.content)
+    types = [event["type"] for event in events]
+    assert response.status_code == 200
+    assert types == [
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    item_id = events[1]["item"]["id"]
+    assert events[1]["item"]["call_id"] == "call-stream-1"
+    assert events[2]["item_id"] == item_id
+    assert events[2]["delta"] == '{"city": "Taipei"}'
+    assert events[3]["arguments"] == '{"city": "Taipei"}'
+    assert events[4]["item"]["id"] == item_id
+    assert events[4]["item"]["status"] == "completed"
+
+
+def test_responses_stream_upstream_http_error_stays_an_ordinary_http_error(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """An upstream status failure is returned before response.created exists."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        status_code=400,
+        error_body=b'{"message":"bad request","reason":"INVALID_MODEL_ID"}',
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert "response.created" not in response.text
+
+
+def test_responses_stream_retries_generation_before_first_event(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A pre-event transport failure retries without exposing a partial lifecycle."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[[{"content": "after retry"}]],
+        prefetch_failures=1,
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    events = _parse_response_sse(response.content)
+    assert response.status_code == 200
+    assert len(transport.payloads) == 2
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.completed"
+    assert [event["delta"] for event in events if event["type"] == "response.output_text.delta"] == [
+        "after retry"
+    ]
+
+
+def test_responses_stream_fails_over_only_before_first_event(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Account failover happens during prefetch and never restarts an established stream."""
+    from main import app
+    from kiro.account_manager import Account
+    import kiro.routes_responses as routes_module
+
+    transport = KiroResponsesTransport(
+        event_batches=[[{"content": "from second account"}]],
+        prefetch_failures=1,
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(routes_module, "FIRST_TOKEN_MAX_RETRIES", 1)
+    monkeypatch.setattr(app.state, "account_system", True)
+
+    original_manager = app.state.account_manager
+    original_account = next(iter(original_manager._accounts.values()))
+    account_one = Account(
+        id="stream-account-one",
+        auth_manager=original_account.auth_manager,
+        model_cache=original_account.model_cache,
+        model_resolver=original_account.model_resolver,
+    )
+    account_two = Account(
+        id="stream-account-two",
+        auth_manager=original_account.auth_manager,
+        model_cache=original_account.model_cache,
+        model_resolver=original_account.model_resolver,
+    )
+    monkeypatch.setattr(
+        original_manager,
+        "_accounts",
+        {account_one.id: account_one, account_two.id: account_two},
+    )
+
+    async def choose_account(request, model, exclude_accounts=None):
+        """Select the second isolated account after the first prefetch fails."""
+        return account_two if exclude_accounts else account_one
+
+    monkeypatch.setattr(routes_module, "_select_account", choose_account)
+    monkeypatch.setattr(original_manager, "report_failure", AsyncMock())
+    monkeypatch.setattr(original_manager, "report_success", AsyncMock())
+
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    events = _parse_response_sse(response.content)
+    assert response.status_code == 200
+    assert len(transport.payloads) == 2
+    assert [event["type"] for event in events].count("response.created") == 1
+    assert events[-1]["type"] == "response.completed"
+    assert [event["delta"] for event in events if event["type"] == "response.output_text.delta"] == [
+        "from second account"
+    ]
+    original_manager.report_failure.assert_awaited_once()
+    original_manager.report_success.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_cancellation_closes_all_request_resources():
+    """Client cancellation closes the parser, upstream response, and HTTP client."""
+    from kiro.converters_responses import convert_responses_request
+    from kiro.responses_streaming import ResponsesStreamState
+    from kiro.models_responses import ResponsesRequest
+    from kiro.routes_responses import _PreparedResponsesStream, _stream_responses_body
+
+    request_data = ResponsesRequest(
+        model="model",
+        input="hello",
+        stream=True,
+    )
+    request_ir = convert_responses_request(request_data)
+
+    async def cancelled_parser() -> AsyncIterator[Any]:
+        """Cancel before a second upstream event can be consumed."""
+        raise asyncio.CancelledError()
+        yield None
+
+    close_http_client = AsyncMock()
+    close_upstream = AsyncMock()
+    manager = SimpleNamespace(
+        report_success=AsyncMock(),
+        report_failure=AsyncMock(),
+    )
+    fake_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(account_manager=manager)),
+        is_disconnected=AsyncMock(return_value=False),
+    )
+    prepared = _PreparedResponsesStream(
+        account=SimpleNamespace(id="account"),
+        http_client=SimpleNamespace(close=close_http_client),
+        upstream_response=SimpleNamespace(aclose=close_upstream),
+        parsed_stream=cancelled_parser(),
+        first_event=None,
+        state=ResponsesStreamState(
+            request=request_data,
+            request_ir=request_ir,
+            response_id="resp_cancel",
+            model_cache=None,
+        ),
+    )
+    body = _stream_responses_body(fake_request, prepared)
+
+    created = await body.__anext__()
+    assert "response.created" in created
+    with pytest.raises(asyncio.CancelledError):
+        await body.__anext__()
+
+    close_http_client.assert_awaited_once()
+    close_upstream.assert_awaited_once()
+    manager.report_success.assert_not_awaited()
+    manager.report_failure.assert_not_awaited()
 
 
 def test_responses_requires_bearer_auth_without_touching_kiro(

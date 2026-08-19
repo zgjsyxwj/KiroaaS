@@ -120,6 +120,7 @@ async def parse_kiro_stream(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     enable_thinking_parser: bool = True,
     deduplicate_result_tool_calls: bool = True,
+    allow_legacy_json: bool = True,
 ) -> AsyncGenerator[KiroEvent, None]:
     """
     Parses Kiro SSE stream and yields unified events.
@@ -133,6 +134,8 @@ async def parse_kiro_stream(
         enable_thinking_parser: Whether to enable thinking block parsing
         deduplicate_result_tool_calls: Whether to preserve duplicate tool
             calls instead of applying the legacy parser deduplication.
+        allow_legacy_json: Whether to accept pre-framed JSON fixtures. Real
+            Responses requests set this to ``False``.
     
     Yields:
         KiroEvent objects representing stream events
@@ -140,7 +143,7 @@ async def parse_kiro_stream(
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
     """
-    parser = AwsEventStreamParser()
+    parser = AwsEventStreamParser(allow_legacy_json=allow_legacy_json)
     first_token_received = False
     
     # Initialize thinking parser if fake reasoning is enabled
@@ -185,6 +188,11 @@ async def parse_kiro_stream(
             
             async for event in _process_chunk(parser, chunk, thinking_parser):
                 yield event
+
+        # A transport chunk may end anywhere inside an AWS frame. The parser
+        # owns the boundary, so EOF is the only point at which a partial frame
+        # can be reported as a protocol error.
+        parser.finalize()
         
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
@@ -296,6 +304,7 @@ async def collect_stream_to_result(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     enable_thinking_parser: bool = True,
     deduplicate_result_tool_calls: bool = True,
+    allow_legacy_json: bool = True,
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
@@ -309,6 +318,8 @@ async def collect_stream_to_result(
         enable_thinking_parser: Whether to enable thinking block parsing
         deduplicate_result_tool_calls: Whether to preserve duplicate tool
             calls instead of applying the legacy parser deduplication.
+        allow_legacy_json: Whether to accept pre-framed JSON fixtures. Real
+            Responses requests set this to ``False``.
     
     Returns:
         StreamResult with full content, thinking, tool calls, and usage
@@ -321,6 +332,7 @@ async def collect_stream_to_result(
         first_token_timeout,
         enable_thinking_parser,
         deduplicate_result_tool_calls,
+        allow_legacy_json,
     ):
         if event.type == "content" and event.content:
             result.content += event.content

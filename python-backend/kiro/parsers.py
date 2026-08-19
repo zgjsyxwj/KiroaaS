@@ -30,7 +30,9 @@ Contains classes and functions for:
 import codecs
 import json
 import re
+import struct
 from typing import Any, Dict, List, Optional
+import zlib
 
 from loguru import logger
 
@@ -248,9 +250,15 @@ class AwsEventStreamParser:
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
-    
-    def __init__(self):
+
+    _MIN_FRAME_LENGTH = 16
+    _MAX_FRAME_LENGTH = 16 * 1024 * 1024
+
+    def __init__(self, allow_legacy_json: bool = True):
         """Initializes the parser."""
+        self._wire_buffer = b""
+        self._mode: Optional[str] = None
+        self._allow_legacy_json = allow_legacy_json
         self.buffer = ""
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
             errors="ignore"
@@ -269,48 +277,242 @@ class AwsEventStreamParser:
         Returns:
             List of events in {"type": str, "data": Any} format
         """
+        if not isinstance(chunk, bytes):
+            raise TypeError("AWS Event Stream chunks must be bytes")
+
+        if self._mode is None:
+            self._wire_buffer += chunk
+            self._mode = self._detect_mode()
+            if self._mode is None:
+                return []
+            if self._mode == "legacy":
+                legacy_chunk = self._wire_buffer
+                self._wire_buffer = b""
+                return self._feed_legacy(legacy_chunk)
+        elif self._mode == "legacy":
+            return self._feed_legacy(chunk)
+        else:
+            self._wire_buffer += chunk
+
+        return self._feed_aws_frames()
+
+    def _detect_mode(self) -> Optional[str]:
+        """Detect a real AWS stream or the repository's legacy JSON fixture."""
+        stripped = self._wire_buffer.lstrip()
+        if stripped.startswith((b"{", b"[")):
+            if not self._allow_legacy_json:
+                raise ValueError("Responses upstream must use AWS Event Stream frames")
+            return "legacy"
+        if len(self._wire_buffer) < 4:
+            return None
+
+        total_length = struct.unpack(">I", self._wire_buffer[:4])[0]
+        if self._MIN_FRAME_LENGTH <= total_length <= self._MAX_FRAME_LENGTH:
+            return "aws"
+
+        # Existing OpenAI/Anthropic unit fixtures predate framed transport and
+        # contain JSON preceded by harmless invalid bytes. Keep that fixture
+        # boundary isolated from the strict AWS parser.
+        if self._allow_legacy_json and b"{" in self._wire_buffer[:64]:
+            return "legacy"
+        raise ValueError(f"Invalid AWS Event Stream total length: {total_length}")
+
+    def _feed_legacy(self, chunk: bytes) -> List[Dict[str, Any]]:
+        """Parse a legacy raw-JSON fixture stream without treating it as AWS."""
         try:
-            # HTTP chunks are transport boundaries, not character boundaries.
-            # Keep incomplete UTF-8 sequences in the incremental decoder so
-            # content is not silently lost when Kiro splits a code point.
             self.buffer += self._utf8_decoder.decode(chunk, final=False)
         except (UnicodeError, TypeError):
             return []
-        
-        events = []
-        
+        return self._parse_json_buffer(deduplicate_content=True)
+
+    def _feed_aws_frames(self) -> List[Dict[str, Any]]:
+        """Consume complete AWS frames from the buffered wire bytes."""
+        events: List[Dict[str, Any]] = []
         while True:
-            # Find nearest pattern
+            if len(self._wire_buffer) < 12:
+                return events
+
+            total_length, headers_length = struct.unpack(">II", self._wire_buffer[:8])
+            if not self._MIN_FRAME_LENGTH <= total_length <= self._MAX_FRAME_LENGTH:
+                raise ValueError(f"Invalid AWS Event Stream total length: {total_length}")
+            if headers_length > total_length - self._MIN_FRAME_LENGTH:
+                raise ValueError(
+                    "Invalid AWS Event Stream headers length: "
+                    f"{headers_length} for frame length {total_length}"
+                )
+            if len(self._wire_buffer) < total_length:
+                return events
+
+            frame = self._wire_buffer[:total_length]
+            self._wire_buffer = self._wire_buffer[total_length:]
+            prelude = frame[:8]
+            expected_prelude_crc = struct.unpack(">I", frame[8:12])[0]
+            actual_prelude_crc = zlib.crc32(prelude) & 0xFFFFFFFF
+            if actual_prelude_crc != expected_prelude_crc:
+                raise ValueError("AWS Event Stream prelude CRC mismatch")
+
+            expected_message_crc = struct.unpack(">I", frame[-4:])[0]
+            actual_message_crc = zlib.crc32(frame[:-4]) & 0xFFFFFFFF
+            if actual_message_crc != expected_message_crc:
+                raise ValueError("AWS Event Stream message CRC mismatch")
+
+            headers_start = 12
+            headers_end = headers_start + headers_length
+            headers = self._parse_headers(frame[headers_start:headers_end])
+            payload = frame[headers_end:-4]
+            try:
+                payload_text = payload.decode("utf-8")
+                data = json.loads(payload_text)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("AWS Event Stream payload is not valid UTF-8 JSON") from exc
+            if not isinstance(data, dict):
+                raise ValueError("AWS Event Stream payload must be a JSON object")
+            message_type = headers.get(":message-type")
+            if message_type not in {None, "event"}:
+                raise ValueError(
+                    "AWS Event Stream upstream error message: "
+                    f"{message_type}"
+                )
+            event = self._process_payload(data)
+            if event:
+                events.append(event)
+
+    @staticmethod
+    def _parse_headers(raw_headers: bytes) -> Dict[str, Any]:
+        """Decode AWS Event Stream headers and reject malformed lengths/types."""
+        headers: Dict[str, Any] = {}
+        position = 0
+        while position < len(raw_headers):
+            name_length = raw_headers[position]
+            position += 1
+            name_end = position + name_length
+            if name_end >= len(raw_headers):
+                raise ValueError("AWS Event Stream header name is truncated")
+            try:
+                name = raw_headers[position:name_end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("AWS Event Stream header name is not UTF-8") from exc
+            position = name_end
+            if position >= len(raw_headers):
+                raise ValueError("AWS Event Stream header type is missing")
+            value_type = raw_headers[position]
+            position += 1
+            if value_type == 0:
+                value: Any = True
+            elif value_type == 1:
+                value = False
+            elif value_type == 2:
+                if position + 1 > len(raw_headers):
+                    raise ValueError("AWS Event Stream byte header is truncated")
+                value = raw_headers[position]
+                position += 1
+            elif value_type == 3:
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position, 2, name
+                )
+                value = struct.unpack(">H", raw_headers[position - 2:position])[0]
+            elif value_type == 4:
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position, 4, name
+                )
+                value = struct.unpack(">I", raw_headers[position - 4:position])[0]
+            elif value_type == 5:
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position, 8, name
+                )
+                value = struct.unpack(">Q", raw_headers[position - 8:position])[0]
+            elif value_type == 6:
+                if position + 2 > len(raw_headers):
+                    raise ValueError(f"AWS Event Stream byte-array header '{name}' is truncated")
+                value_length = struct.unpack(">H", raw_headers[position:position + 2])[0]
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position + 2, value_length, name
+                )
+                value = raw_headers[position - value_length:position]
+            elif value_type == 7:
+                if position + 2 > len(raw_headers):
+                    raise ValueError(f"AWS Event Stream string header '{name}' is truncated")
+                value_length = struct.unpack(">H", raw_headers[position:position + 2])[0]
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position + 2, value_length, name
+                )
+                try:
+                    value = raw_headers[position - value_length:position].decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"AWS Event Stream header '{name}' is not UTF-8") from exc
+            elif value_type == 8:
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position, 8, name
+                )
+                value = struct.unpack(">q", raw_headers[position - 8:position])[0]
+            elif value_type == 9:
+                position = AwsEventStreamParser._require_header_bytes(
+                    raw_headers, position, 16, name
+                )
+                value = raw_headers[position - 16:position]
+            else:
+                raise ValueError(f"Unsupported AWS Event Stream header type: {value_type}")
+            headers[name] = value
+        return headers
+
+    @staticmethod
+    def _require_header_bytes(
+        raw_headers: bytes, position: int, length: int, name: str
+    ) -> int:
+        """Advance a header cursor only when the requested value is complete."""
+        end = position + length
+        if end > len(raw_headers):
+            raise ValueError(f"AWS Event Stream header '{name}' is truncated")
+        return end
+
+    def _parse_json_buffer(self, deduplicate_content: bool) -> List[Dict[str, Any]]:
+        """Parse complete JSON objects from the compatibility buffer."""
+        events: List[Dict[str, Any]] = []
+        while True:
             earliest_pos = -1
-            earliest_type = None
-            
+            earliest_type: Optional[str] = None
             for pattern, event_type in self.EVENT_PATTERNS:
                 pos = self.buffer.find(pattern)
                 if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
                     earliest_pos = pos
                     earliest_type = event_type
-            
             if earliest_pos == -1:
                 break
-            
-            # Find JSON end
             json_end = find_matching_brace(self.buffer, earliest_pos)
             if json_end == -1:
-                # JSON not complete, wait for more data
                 break
-            
             json_str = self.buffer[earliest_pos:json_end + 1]
             self.buffer = self.buffer[json_end + 1:]
-            
             try:
                 data = json.loads(json_str)
-                event = self._process_event(data, earliest_type)
+                event = self._process_payload(data, deduplicate_content=deduplicate_content)
                 if event:
                     events.append(event)
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
-        
         return events
+
+    def _process_payload(
+        self, data: Dict[str, Any], deduplicate_content: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Classify one decoded Kiro payload without relying on transport chunks."""
+        for pattern, event_type in self.EVENT_PATTERNS:
+            if pattern.startswith("{") and data:
+                key = pattern[len("{"):].split(":", 1)[0].strip('"')
+                if key in data:
+                    if event_type == "content":
+                        return self._process_content_event(data, deduplicate=deduplicate_content)
+                    return self._process_event(data, event_type)
+        return None
+
+    def finalize(self) -> None:
+        """Validate that an AWS stream did not end in the middle of a frame."""
+        if self._mode == "aws" and self._wire_buffer:
+            raise ValueError("AWS Event Stream ended with a partial frame")
+        if self._mode is None and self._wire_buffer and not self._allow_legacy_json:
+            raise ValueError("AWS Event Stream ended before a complete frame header")
+        if self._mode == "legacy":
+            self.buffer += self._utf8_decoder.decode(b"", final=True)
     
     def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
         """
@@ -338,7 +540,9 @@ class AwsEventStreamParser:
         
         return None
     
-    def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
+    def _process_content_event(
+        self, data: dict, deduplicate: bool = True
+    ) -> Optional[Dict[str, Any]]:
         """Processes content event."""
         content = data.get('content', '')
         
@@ -347,7 +551,7 @@ class AwsEventStreamParser:
             return None
         
         # Deduplicate repeating content
-        if content == self.last_content:
+        if deduplicate and content == self.last_content:
             return None
         
         self.last_content = content
@@ -592,6 +796,8 @@ class AwsEventStreamParser:
     
     def reset(self) -> None:
         """Resets parser state."""
+        self._wire_buffer = b""
+        self._mode = None
         self.buffer = ""
         self.last_content = None
         self.current_tool_call = None

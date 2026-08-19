@@ -800,10 +800,6 @@ def _extract_verbosity(request: ResponsesRequest) -> Optional[str]:
 
 def _validate_request_capabilities(request: ResponsesRequest) -> None:
     """Reject stateful or contract-changing capabilities not implemented yet."""
-    if request.stream:
-        raise ResponsesConversionError(
-            "Streaming Responses is not implemented; set stream=false"
-        )
     if request.store is True:
         raise ResponsesConversionError("Responses storage is not supported; omit store or set store=false")
     if request.previous_response_id is not None:
