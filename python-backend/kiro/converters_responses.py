@@ -28,12 +28,55 @@ THINKING_BUDGETS: Dict[str, int] = {
 }
 
 _HOSTED_TOOL_TYPES = {
+    "code_interpreter",
+    "computer",
     "computer_use_preview",
     "file_search",
     "image_generation",
     "mcp",
+    "remote_mcp",
     "web_search",
     "web_search_preview",
+}
+
+_SUPPORTED_CLIENT_TOOL_TYPES = (
+    "function",
+    "custom",
+    "shell",
+    "local_shell",
+    "tool_search",
+    "apply_patch",
+)
+
+_CLIENT_CALL_ITEM_TYPES = {
+    "function_call": "function",
+    "custom_tool_call": "custom",
+    "shell_call": "shell",
+    "local_shell_call": "local_shell",
+    "tool_search_call": "tool_search",
+    "apply_patch_call": "apply_patch",
+}
+
+_CLIENT_RESULT_ITEM_TYPES = {
+    "function_call_output": "function",
+    "custom_tool_call_output": "custom",
+    "shell_call_output": "shell",
+    "local_shell_call_output": "local_shell",
+    "tool_search_output": "tool_search",
+    "apply_patch_call_output": "apply_patch",
+}
+
+_DEFAULT_TOOL_NAMES = {
+    "shell": "shell",
+    "local_shell": "local_shell",
+    "tool_search": "tool_search",
+    "apply_patch": "apply_patch",
+}
+
+_CUSTOM_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {"input": {"type": "string"}},
+    "required": ["input"],
 }
 
 _VERBOSITY_VALUES = {"low", "medium", "high"}
@@ -56,6 +99,7 @@ class ResponsesInputItemIR:
     images: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     tool_result: Optional[str] = None
+    tool_type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +110,7 @@ class ResponsesToolIR:
     name: str
     description: Optional[str]
     parameters: Dict[str, Any]
+    execution: Optional[str] = None
 
     def as_unified_tool(self) -> UnifiedTool:
         """Return the Kiro-neutral tool representation."""
@@ -74,6 +119,62 @@ class ResponsesToolIR:
             description=self.description,
             input_schema=self.parameters,
         )
+
+
+@dataclass
+class ResponsesToolRegistry:
+    """Track registered Client Tools by name and Tool Call identity."""
+
+    by_name: Dict[str, ResponsesToolIR] = field(default_factory=dict)
+    by_call_id: Dict[str, ResponsesToolIR] = field(default_factory=dict)
+
+    def register(self, tool: ResponsesToolIR) -> None:
+        """Register one tool definition, rejecting duplicate names."""
+        if tool.name in self.by_name:
+            existing = self.by_name[tool.name]
+            if existing.external_type != tool.external_type:
+                raise ResponsesConversionError(
+                    f"Tool type conflict for name '{tool.name}': "
+                    f"already registered as {existing.external_type}, "
+                    f"cannot register {tool.external_type}"
+                )
+            raise ResponsesConversionError(
+                f"Duplicate Client Tool registration for name '{tool.name}'"
+            )
+        self.by_name[tool.name] = tool
+
+    def bind_call(self, call_id: str, tool: ResponsesToolIR) -> None:
+        """Bind a Tool Call identity to its registered Client Tool."""
+        existing = self.by_call_id.get(call_id)
+        if existing is not None:
+            if (
+                existing.name != tool.name
+                or existing.external_type != tool.external_type
+            ):
+                raise ResponsesConversionError(
+                    f"Tool type conflict for call_id '{call_id}': "
+                    f"registered as {existing.external_type} '{existing.name}', "
+                    f"received {tool.external_type} '{tool.name}'"
+                )
+            raise ResponsesConversionError(
+                f"Duplicate Tool Call call_id '{call_id}'"
+            )
+        self.by_call_id[call_id] = tool
+
+    def resolve(self, call_id: str, name: str) -> ResponsesToolIR:
+        """Resolve one upstream Tool Call using identity first, then name."""
+        by_call_id = self.by_call_id.get(call_id)
+        by_name = self.by_name.get(name)
+        if by_call_id is None or by_name is None:
+            raise ResponsesConversionError(
+                f"Kiro returned Tool Call '{name}' with call_id '{call_id}' "
+                "without a matching Client Tool registry entry"
+            )
+        if by_call_id is not by_name:
+            raise ResponsesConversionError(
+                f"Tool registry conflict for call_id '{call_id}' and name '{name}'"
+            )
+        return by_call_id
 
 
 @dataclass(frozen=True)
@@ -89,6 +190,7 @@ class ResponsesRequestIR:
     messages: List[UnifiedMessage]
     tokenizer_messages: List[Dict[str, Any]]
     thinking_config: ThinkingConfig
+    tool_registry: ResponsesToolRegistry
 
     @property
     def unified_tools(self) -> Optional[List[UnifiedTool]]:
@@ -259,36 +361,91 @@ def _normalize_image_block(block: Dict[str, Any], field_name: str) -> Dict[str, 
     return {"type": "image_url", "image_url": {"url": image_url}}
 
 
-def _convert_tool_call(item: ResponsesInputItem) -> Dict[str, Any]:
-    """Convert a replayed Responses function call to unified tool-call form."""
-    if not item.call_id or not item.name:
-        raise ResponsesConversionError(
-            "function_call items require both call_id and name"
-        )
-    arguments = item.arguments if item.arguments is not None else "{}"
+def _parse_tool_arguments(value: Any, call_id: str, tool_type: str) -> str:
+    """Normalize one replayed non-custom Client Tool payload to JSON."""
+    arguments = "{}" if value is None else value
     if not isinstance(arguments, str):
-        arguments = json.dumps(arguments, ensure_ascii=False)
+        try:
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ResponsesConversionError(
+                f"{tool_type}_call '{call_id}' arguments must be JSON"
+            ) from exc
     try:
         parsed_arguments = json.loads(arguments)
     except json.JSONDecodeError as exc:
         raise ResponsesConversionError(
-            f"function_call '{item.call_id}' arguments must be valid JSON"
+            f"{tool_type}_call '{call_id}' arguments must be valid JSON"
         ) from exc
     if not isinstance(parsed_arguments, dict):
         raise ResponsesConversionError(
-            f"function_call '{item.call_id}' arguments must be a JSON object"
+            f"{tool_type}_call '{call_id}' arguments must be a JSON object"
         )
+    return arguments
+
+
+def _tool_call_name(item: ResponsesInputItem, tool_type: str) -> str:
+    """Return the explicit or protocol-defined name for a Tool Call."""
+    name = item.name or _DEFAULT_TOOL_NAMES.get(tool_type)
+    if not isinstance(name, str) or not name:
+        raise ResponsesConversionError(
+            f"{item.type} items require a non-empty tool name"
+        )
+    return name
+
+
+def _convert_tool_call(
+    item: ResponsesInputItem,
+    tool_type: str,
+) -> Dict[str, Any]:
+    """Convert one replayed Client Tool Call to Kiro function form."""
+    if not item.call_id:
+        raise ResponsesConversionError(
+            f"{item.type} items require call_id"
+        )
+    name = _tool_call_name(item, tool_type)
+    if tool_type == "custom":
+        if not isinstance(item.input, str):
+            raise ResponsesConversionError(
+                f"custom_tool_call '{item.call_id}' input must be a raw string"
+            )
+        arguments = json.dumps({"input": item.input}, ensure_ascii=False)
+    elif tool_type == "shell":
+        arguments = _parse_tool_arguments(item.action, item.call_id, tool_type)
+    elif tool_type == "local_shell":
+        arguments = _parse_tool_arguments(item.action, item.call_id, tool_type)
+    elif tool_type == "tool_search":
+        arguments = _parse_tool_arguments(item.arguments, item.call_id, tool_type)
+    elif tool_type == "apply_patch":
+        arguments = _parse_tool_arguments(item.operation, item.call_id, tool_type)
+    else:
+        arguments = _parse_tool_arguments(item.arguments, item.call_id, tool_type)
     return {
         "id": item.call_id,
         "type": "function",
-        "function": {"name": item.name, "arguments": arguments},
+        "function": {"name": name, "arguments": arguments},
     }
 
 
-def _convert_tool_result(item: ResponsesInputItem) -> Dict[str, Any]:
-    """Convert a replayed Responses function output to unified tool-result form."""
-    if not item.call_id:
-        raise ResponsesConversionError("function_call_output items require call_id")
+def _result_call_id(item: ResponsesInputItem, tool_type: str) -> Optional[str]:
+    """Return the original call identity for a replayed Tool Result."""
+    if item.call_id:
+        return item.call_id
+    # The official local-shell output shape uses ``id`` for the originating
+    # local shell call, while the other supported result shapes use call_id.
+    if tool_type == "local_shell" and item.id:
+        return item.id
+    return None
+
+
+def _convert_tool_result(
+    item: ResponsesInputItem,
+    tool_type: str,
+) -> Dict[str, Any]:
+    """Convert a replayed Responses Tool Result to unified form."""
+    call_id = _result_call_id(item, tool_type)
+    if not call_id:
+        raise ResponsesConversionError(f"{item.type} items require call_id")
     output = item.output
     if output is None:
         output = item.content
@@ -300,7 +457,7 @@ def _convert_tool_result(item: ResponsesInputItem) -> Dict[str, Any]:
         output_text = str(output)
     return {
         "type": "tool_result",
-        "tool_use_id": item.call_id,
+        "tool_use_id": call_id,
         "content": output_text or "(empty result)",
     }
 
@@ -309,8 +466,9 @@ def _convert_input_item(item: ResponsesInputItem) -> ResponsesInputItemIR:
     """Convert one Pydantic item to the protocol IR."""
     item_type = item.type or "message"
 
-    if item_type == "function_call":
-        call = _convert_tool_call(item)
+    if item_type in _CLIENT_CALL_ITEM_TYPES:
+        tool_type = _CLIENT_CALL_ITEM_TYPES[item_type]
+        call = _convert_tool_call(item, tool_type)
         return ResponsesInputItemIR(
             item_type=item_type,
             role="assistant",
@@ -319,18 +477,21 @@ def _convert_input_item(item: ResponsesInputItem) -> ResponsesInputItemIR:
             content=item.content,
             text="",
             tool_calls=[call],
+            tool_type=tool_type,
         )
 
-    if item_type == "function_call_output":
-        result = _convert_tool_result(item)
+    if item_type in _CLIENT_RESULT_ITEM_TYPES:
+        tool_type = _CLIENT_RESULT_ITEM_TYPES[item_type]
+        result = _convert_tool_result(item, tool_type)
         return ResponsesInputItemIR(
             item_type=item_type,
             role="user",
             item_id=item.id,
-            call_id=item.call_id,
+            call_id=result["tool_use_id"],
             content=item.output if item.output is not None else item.content,
             text=result["content"],
             tool_result=result["content"],
+            tool_type=tool_type,
         )
 
     if item_type == "reasoning":
@@ -390,28 +551,52 @@ def _convert_input_item(item: ResponsesInputItem) -> ResponsesInputItemIR:
 
 
 def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[ResponsesToolIR]:
-    """Convert supported client tools and reject hosted tools explicitly."""
+    """Convert supported Client Tools and reject Hosted Tools explicitly."""
     converted: List[ResponsesToolIR] = []
     for tool in tools or []:
         tool_type = tool.get("type")
         if not isinstance(tool_type, str):
+            supported = ", ".join(_SUPPORTED_CLIENT_TOOL_TYPES)
             raise ResponsesConversionError(
-                f"Unsupported Responses tool type: {tool_type or 'missing type'}"
+                f"Unsupported Client Tool type '{tool_type or 'missing type'}'. "
+                f"Supported Client Tool types: {supported}"
             )
         if tool_type in _HOSTED_TOOL_TYPES:
             raise ResponsesConversionError(
                 f"Hosted Tool '{tool_type}' is not supported by KiroaaS Responses"
             )
-        if tool_type != "function":
+        if tool_type == "tool_search" and tool.get("execution") == "server":
             raise ResponsesConversionError(
-                f"Unsupported Responses tool type: {tool_type or 'missing type'}"
+                "Hosted Tool 'tool_search' with execution=server is not supported; "
+                "use a client-executed tool_search definition"
+            )
+        if tool_type == "tool_search" and tool.get("execution") not in {
+            None,
+            "client",
+        }:
+            raise ResponsesConversionError(
+                "tool_search execution must be 'client' when provided"
+            )
+        if tool_type not in _SUPPORTED_CLIENT_TOOL_TYPES:
+            supported = ", ".join(_SUPPORTED_CLIENT_TOOL_TYPES)
+            raise ResponsesConversionError(
+                f"Unsupported Client Tool type '{tool_type or 'missing type'}'. "
+                f"Supported Client Tool types: {supported}"
             )
 
         function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        name = function.get("name")
+        name = function.get("name") or _DEFAULT_TOOL_NAMES.get(tool_type)
         if not isinstance(name, str) or not name:
-            raise ResponsesConversionError("function tools require a non-empty name")
-        parameters = function.get("parameters", function.get("input_schema", {}))
+            raise ResponsesConversionError(
+                f"{tool_type} tools require a non-empty name"
+            )
+        if tool_type == "custom":
+            parameters = _CUSTOM_TOOL_PARAMETERS
+        else:
+            parameters = function.get(
+                "parameters",
+                function.get("input_schema", tool.get("parameters", {})),
+            )
         if parameters is None:
             parameters = {}
         if not isinstance(parameters, dict):
@@ -422,10 +607,11 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[ResponsesToolI
             )
         converted.append(
             ResponsesToolIR(
-                external_type="function",
+                external_type=tool_type,
                 name=name,
                 description=function.get("description"),
                 parameters=parameters,
+                execution=tool.get("execution") if tool_type == "tool_search" else None,
             )
         )
     return converted
@@ -570,49 +756,98 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
         raise ResponsesConversionError("input must contain at least one item")
 
     response_tools = _convert_tools(request.tools)
+    tool_registry = ResponsesToolRegistry()
+    for response_tool in response_tools:
+        tool_registry.register(response_tool)
     replayed_tool_items = {
         item.item_type
         for item in items
-        if item.item_type in {"function_call", "function_call_output"}
+        if item.item_type in {
+            *_CLIENT_CALL_ITEM_TYPES,
+            *_CLIENT_RESULT_ITEM_TYPES,
+        }
     }
     if replayed_tool_items and not response_tools:
         raise ResponsesConversionError(
             "Tool Call replay requires the corresponding function definitions "
-            "in the tools field; resend the complete Client Tool registry"
+            "or Client Tool definitions in the tools field; resend the complete "
+            "Client Tool registry"
         )
-    registered_tool_names = {tool.name for tool in response_tools}
     known_call_ids = set()
     returned_call_ids = set()
     for item in items:
-        if item.item_type == "function_call" and item.call_id:
-            if item.call_id in known_call_ids:
-                raise ResponsesConversionError(
-                    f"Duplicate function_call call_id: {item.call_id}"
-                )
+        if item.item_type in _CLIENT_CALL_ITEM_TYPES and item.call_id:
             call_name = item.tool_calls[0]["function"]["name"]
-            if registered_tool_names and call_name not in registered_tool_names:
+            if item.call_id in known_call_ids:
+                existing_tool = tool_registry.by_call_id[item.call_id]
+                expected_type = _CLIENT_CALL_ITEM_TYPES[item.item_type]
+                if (
+                    existing_tool.name != call_name
+                    or existing_tool.external_type != expected_type
+                ):
+                    raise ResponsesConversionError(
+                        f"Tool type conflict for call_id '{item.call_id}': "
+                        f"registered as {existing_tool.external_type} "
+                        f"'{existing_tool.name}', received {expected_type} "
+                        f"'{call_name}'"
+                    )
+                raise ResponsesConversionError(
+                    f"Duplicate {item.item_type} call_id: {item.call_id}"
+                )
+            registered_tool = tool_registry.by_name.get(call_name)
+            if registered_tool is None:
                 raise ResponsesConversionError(
                     f"function_call '{item.call_id}' references unregistered tool "
                     f"'{call_name}'; resend its function definition in tools"
                 )
-            known_call_ids.add(item.call_id)
-        elif item.item_type == "function_call_output":
-            if item.call_id not in known_call_ids:
+            expected_type = _CLIENT_CALL_ITEM_TYPES[item.item_type]
+            if registered_tool.external_type != expected_type:
                 raise ResponsesConversionError(
-                    "function_call_output has no preceding function_call for call_id "
+                    f"Tool type conflict for call_id '{item.call_id}': "
+                    f"item is {expected_type}, registry entry is "
+                    f"{registered_tool.external_type}"
+                )
+            tool_registry.bind_call(item.call_id, registered_tool)
+            known_call_ids.add(item.call_id)
+        elif item.item_type in _CLIENT_RESULT_ITEM_TYPES:
+            if item.call_id not in known_call_ids:
+                expected_type = _CLIENT_RESULT_ITEM_TYPES[item.item_type]
+                preceding = (
+                    "function_call"
+                    if expected_type == "function"
+                    else "Tool Call"
+                )
+                raise ResponsesConversionError(
+                    f"{item.item_type} has no preceding {preceding} for call_id "
                     f"{item.call_id}"
+                )
+            registered_tool = tool_registry.by_call_id[item.call_id]
+            expected_type = _CLIENT_RESULT_ITEM_TYPES[item.item_type]
+            if registered_tool.external_type != expected_type:
+                raise ResponsesConversionError(
+                    f"Tool type conflict for call_id '{item.call_id}': "
+                    f"result is {expected_type}, registry entry is "
+                    f"{registered_tool.external_type}"
                 )
             if item.call_id in returned_call_ids:
                 raise ResponsesConversionError(
-                    "Duplicate function_call_output for call_id "
+                    f"Duplicate {item.item_type} for call_id "
                     f"{item.call_id}; send exactly one result for each Tool Call"
                 )
             returned_call_ids.add(item.call_id)
     missing_results = known_call_ids - returned_call_ids
     if missing_results:
         missing = ", ".join(sorted(missing_results))
+        missing_label = (
+            "missing matching function_call_output items"
+            if all(
+                tool_registry.by_call_id[call_id].external_type == "function"
+                for call_id in missing_results
+            )
+            else "missing matching Tool Result items"
+        )
         raise ResponsesConversionError(
-            "function_call items are missing matching function_call_output items: "
+            f"Tool Call items have {missing_label}: "
             f"{missing}"
         )
 
@@ -647,7 +882,7 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
                     "tool_use_id": item.call_id or "",
                     "content": item.tool_result or "(empty result)",
                 }]
-                if item.item_type == "function_call_output"
+                if item.item_type in _CLIENT_RESULT_ITEM_TYPES
                 else None
             ),
             images=item.images or None,
@@ -691,4 +926,5 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
         messages=messages,
         tokenizer_messages=tokenizer_messages,
         thinking_config=_extract_reasoning_config(request),
+        tool_registry=tool_registry,
     )

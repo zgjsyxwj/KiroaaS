@@ -22,7 +22,15 @@ class ResponsesInputItem(BaseModel):
     status: Optional[str] = None
     call_id: Optional[str] = None
     name: Optional[str] = None
-    arguments: Optional[str] = None
+    arguments: Any = None
+    input: Any = None
+    action: Any = None
+    operation: Any = None
+    execution: Optional[str] = None
+    tools: Any = None
+    caller: Any = None
+    environment: Any = None
+    namespace: Optional[str] = None
     output: Any = None
     summary: Any = None
     encrypted_content: Any = None

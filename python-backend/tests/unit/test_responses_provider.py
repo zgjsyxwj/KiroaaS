@@ -388,7 +388,11 @@ def test_responses_rejects_tool_replay_without_complete_tool_registry():
 
 def test_responses_output_omits_empty_message_and_preserves_tool_call_ids():
     """Output contains only non-empty message or function-call items."""
-    request = ResponsesRequest(model="external-model", input="call a tool")
+    request = ResponsesRequest(
+        model="external-model",
+        input="call a tool",
+        tools=[{"type": "function", "name": "run", "parameters": {}}],
+    )
     request_ir = convert_responses_request(request)
     result = StreamResult(
         tool_calls=[
@@ -418,6 +422,280 @@ def test_responses_output_omits_empty_message_and_preserves_tool_call_ids():
     assert body["usage"]["input_tokens"] > 0
     assert body["usage"]["output_tokens"] > 0
     assert body["usage"]["total_tokens"] > 0
+
+
+def test_responses_custom_tool_bridges_raw_input_and_restores_custom_call():
+    """Custom tools use a single Kiro input field and keep raw Responses input."""
+    request = ResponsesRequest(
+        model="model",
+        input="apply a patch",
+        tools=[
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a unified diff.",
+            }
+        ],
+    )
+    request_ir = convert_responses_request(request)
+
+    assert request_ir.tools[0].external_type == "custom"
+    assert request_ir.tools[0].parameters == {
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+    }
+
+    body = build_responses_object(
+        request,
+        request_ir,
+        StreamResult(
+            tool_calls=[
+                {
+                    "id": "call-patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": '{"input":"*** Begin Patch\\n*** End Patch"}',
+                    },
+                }
+            ]
+        ),
+        model_cache=None,
+        response_id="resp_custom",
+    )
+
+    assert body["output"][0]["type"] == "custom_tool_call"
+    assert body["output"][0]["call_id"] == "call-patch"
+    assert body["output"][0]["input"] == "*** Begin Patch\n*** End Patch"
+
+
+@pytest.mark.parametrize(
+    ("tool", "name", "arguments", "expected_type", "expected_field"),
+    [
+        (
+            {"type": "shell"},
+            "shell",
+            '{"commands":["pwd"]}',
+            "shell_call",
+            ("action", {"commands": ["pwd"]}),
+        ),
+        (
+            {"type": "local_shell"},
+            "local_shell",
+            '{"command":["pwd"],"env":{}}',
+            "local_shell_call",
+            ("action", {"command": ["pwd"], "env": {}}),
+        ),
+        (
+            {"type": "tool_search", "execution": "client"},
+            "tool_search",
+            '{"query":"browser"}',
+            "tool_search_call",
+            ("arguments", {"query": "browser"}),
+        ),
+        (
+            {"type": "apply_patch"},
+            "apply_patch",
+            '{"type":"update_file","path":"a.txt","diff":"@@"}',
+            "apply_patch_call",
+            (
+                "operation",
+                {"type": "update_file", "path": "a.txt", "diff": "@@"},
+            ),
+        ),
+    ],
+)
+def test_responses_client_tool_types_are_restored_after_kiro_bridge(
+    tool: Dict[str, Any],
+    name: str,
+    arguments: str,
+    expected_type: str,
+    expected_field: tuple[str, Any],
+) -> None:
+    """Supported Codex Client Tools never collapse into generic function output."""
+    request = ResponsesRequest(model="model", input="run", tools=[tool])
+    request_ir = convert_responses_request(request)
+    assert request_ir.tools[0].external_type == tool["type"]
+
+    body = build_responses_object(
+        request,
+        request_ir,
+        StreamResult(
+            tool_calls=[
+                {
+                    "id": f"call-{name}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ]
+        ),
+        model_cache=None,
+        response_id="resp_client_tool",
+    )
+
+    output = body["output"][0]
+    assert output["type"] == expected_type
+    assert output["call_id"] == f"call-{name}"
+    assert output[expected_field[0]] == expected_field[1]
+
+
+def test_responses_custom_tool_replay_uses_raw_input_and_registered_call_id():
+    """Custom replay converts only at the Kiro boundary and keeps the call ID."""
+    request = ResponsesRequest(
+        model="model",
+        input=[
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-custom",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-custom",
+                "output": "applied",
+            },
+        ],
+        tools=[{"type": "custom", "name": "apply_patch"}],
+    )
+
+    request_ir = convert_responses_request(request)
+    assert request_ir.tool_registry.by_call_id["call-custom"].external_type == "custom"
+    assert request_ir.messages[0].tool_calls[0]["id"] == "call-custom"
+    assert request_ir.messages[0].tool_calls[0]["function"]["arguments"] == (
+        '{"input": "*** Begin Patch\\n*** End Patch"}'
+    )
+    assert request_ir.messages[1].tool_results[0]["tool_use_id"] == "call-custom"
+
+
+def test_responses_tool_registry_rejects_duplicate_and_conflicting_definitions():
+    """Duplicate names and type changes fail before Kiro receives a payload."""
+    with pytest.raises(ResponsesConversionError, match="Duplicate Client Tool"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                tools=[
+                    {"type": "function", "name": "run"},
+                    {"type": "function", "name": "run"},
+                ],
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="Tool type conflict"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                tools=[
+                    {"type": "function", "name": "run"},
+                    {"type": "custom", "name": "run"},
+                ],
+            )
+        )
+
+
+def test_responses_rejects_unknown_and_malformed_client_tools_actionably():
+    """Unknown types list supported choices and custom input stays a string."""
+    with pytest.raises(ResponsesConversionError, match="Supported Client Tool types"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                tools=[{"type": "made_up_tool", "name": "run"}],
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="raw string"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call-custom",
+                        "name": "run",
+                        "input": {"not": "a string"},
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-custom",
+                        "output": "done",
+                    },
+                ],
+                tools=[{"type": "custom", "name": "run"}],
+            )
+        )
+
+
+def test_responses_custom_tool_output_rejects_invalid_bridge_shape():
+    """A malformed Kiro custom bridge cannot become a valid custom Tool Call."""
+    request = ResponsesRequest(
+        model="model",
+        input="run",
+        tools=[{"type": "custom", "name": "run"}],
+    )
+    request_ir = convert_responses_request(request)
+
+    with pytest.raises(ResponsesConversionError, match="exactly one string field 'input'"):
+        build_responses_object(
+            request,
+            request_ir,
+            StreamResult(
+                tool_calls=[
+                    {
+                        "id": "call-custom",
+                        "type": "function",
+                        "function": {
+                            "name": "run",
+                            "arguments": '{"input": "ok", "extra": true}',
+                        },
+                    }
+                ]
+            ),
+            model_cache=None,
+            response_id="resp-custom-invalid",
+        )
+
+
+def test_responses_registry_keeps_parallel_same_name_calls_by_call_id():
+    """Parallel calls to one registered tool cannot overwrite each other."""
+    request = ResponsesRequest(
+        model="model",
+        input="run twice",
+        tools=[{"type": "function", "name": "run", "parameters": {}}],
+    )
+    request_ir = convert_responses_request(request)
+    body = build_responses_object(
+        request,
+        request_ir,
+        StreamResult(
+            tool_calls=[
+                {
+                    "id": "call-one",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": '{"n":1}'},
+                },
+                {
+                    "id": "call-two",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": '{"n":2}'},
+                },
+            ]
+        ),
+        model_cache=None,
+        response_id="resp-parallel",
+    )
+
+    assert [item["call_id"] for item in body["output"]] == [
+        "call-one",
+        "call-two",
+    ]
+    assert [item["arguments"] for item in body["output"]] == [
+        '{"n":1}',
+        '{"n":2}',
+    ]
 
 
 @pytest.mark.parametrize(

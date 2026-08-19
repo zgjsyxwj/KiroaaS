@@ -4,8 +4,9 @@
 
 import json
 import struct
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
+import pytest
 import zlib
 
 
@@ -788,6 +789,8 @@ def test_responses_rejects_duplicate_kiro_tool_call_ids_actionably(
                     "stop": True,
                 },
             ]
+            ,
+            [{"content": "replayed"}],
         ]
     )
 
@@ -809,3 +812,303 @@ def test_responses_rejects_duplicate_kiro_tool_call_ids_actionably(
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "kiro_protocol_error"
     assert "duplicate" in response.json()["error"]["message"].lower()
+
+
+def test_responses_high_level_seam_preserves_all_client_tool_types(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
+    """Every supported Client Tool survives the isolated Kiro bridge explicitly."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "freeform",
+                    "toolUseId": "call-custom",
+                    "input": '{"input":"*** Begin Patch\\n*** End Patch"}',
+                    "stop": True,
+                },
+                {
+                    "name": "shell",
+                    "toolUseId": "call-shell",
+                    "input": '{"commands":["pwd"]}',
+                    "stop": True,
+                },
+                {
+                    "name": "local_shell",
+                    "toolUseId": "call-local-shell",
+                    "input": '{"command":["pwd"],"env":{}}',
+                    "stop": True,
+                },
+                {
+                    "name": "tool_search",
+                    "toolUseId": "call-search",
+                    "input": '{"query":"browser"}',
+                    "stop": True,
+                },
+                {
+                    "name": "apply_patch",
+                    "toolUseId": "call-apply-patch",
+                    "input": '{"type":"update_file","path":"a.txt","diff":"@@"}',
+                    "stop": True,
+                },
+                {
+                    "name": "lookup",
+                    "toolUseId": "call-function",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                },
+            ],
+            [{"content": "replayed"}],
+        ]
+    )
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+
+    tools = [
+        {"type": "custom", "name": "freeform"},
+        {"type": "shell"},
+        {"type": "local_shell"},
+        {"type": "tool_search", "execution": "client"},
+        {"type": "apply_patch"},
+        {"type": "function", "name": "lookup", "parameters": {}},
+    ]
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "Use the tools.", "tools": tools},
+    )
+
+    assert response.status_code == 200
+    output = response.json()["output"]
+    assert [item["type"] for item in output] == [
+        "custom_tool_call",
+        "shell_call",
+        "local_shell_call",
+        "tool_search_call",
+        "apply_patch_call",
+        "function_call",
+    ]
+    assert output[0]["input"] == "*** Begin Patch\n*** End Patch"
+    assert output[1]["action"] == {"commands": ["pwd"]}
+    assert output[2]["action"] == {"command": ["pwd"], "env": {}}
+    assert output[3]["arguments"] == {"query": "browser"}
+    assert output[4]["operation"] == {
+        "type": "update_file",
+        "path": "a.txt",
+        "diff": "@@",
+    }
+    assert [item["call_id"] for item in output] == [
+        "call-custom",
+        "call-shell",
+        "call-local-shell",
+        "call-search",
+        "call-apply-patch",
+        "call-function",
+    ]
+
+    payload_tools = transport.payloads[0]["conversationState"]["currentMessage"][
+        "userInputMessage"
+    ]["userInputMessageContext"]["tools"]
+    assert [tool["toolSpecification"]["name"] for tool in payload_tools] == [
+        "freeform",
+        "shell",
+        "local_shell",
+        "tool_search",
+        "apply_patch",
+        "lookup",
+    ]
+    assert payload_tools[0]["toolSpecification"]["inputSchema"]["json"] == {
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+    }
+
+    replay_input = [
+        {"type": "message", "role": "user", "content": "Use the tools."},
+        *[
+            {
+                key: value
+                for key, value in call.items()
+                if key in {"type", "id", "call_id", "name", "input", "action", "arguments", "operation"}
+            }
+            for call in output
+        ],
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call-custom",
+            "output": "custom result",
+        },
+        {
+            "type": "shell_call_output",
+            "call_id": "call-shell",
+            "output": [{"stdout": "shell result", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}],
+        },
+        {
+            "type": "local_shell_call_output",
+            "call_id": "call-local-shell",
+            "output": "local shell result",
+        },
+        {
+            "type": "tool_search_output",
+            "call_id": "call-search",
+            "output": {"tools": []},
+        },
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call-apply-patch",
+            "output": "patch result",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-function",
+            "output": "function result",
+        },
+    ]
+    replay_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": replay_input, "tools": tools},
+    )
+    assert replay_response.status_code == 200
+    assert replay_response.json()["output"][0]["content"][0]["text"] == "replayed"
+
+    replay_payload = transport.payloads[1]["conversationState"]
+    replay_assistant = replay_payload["history"][1]["assistantResponseMessage"]
+    assert [tool["toolUseId"] for tool in replay_assistant["toolUses"]] == [
+        "call-custom",
+        "call-shell",
+        "call-local-shell",
+        "call-search",
+        "call-apply-patch",
+        "call-function",
+    ]
+    replay_results = replay_payload["currentMessage"]["userInputMessage"][
+        "userInputMessageContext"
+    ]["toolResults"]
+    assert [result["toolUseId"] for result in replay_results] == [
+        "call-custom",
+        "call-shell",
+        "call-local-shell",
+        "call-search",
+        "call-apply-patch",
+        "call-function",
+    ]
+
+
+def test_responses_high_level_seam_replays_custom_type_and_call_id(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
+    """Custom Tool Call and Result replay retain the registered type and identity."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "freeform",
+                    "toolUseId": "call-custom",
+                    "input": '{"input":"raw command"}',
+                    "stop": True,
+                }
+            ],
+            [{"content": "accepted"}],
+        ]
+    )
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+    tool = {"type": "custom", "name": "freeform"}
+    headers = {"Authorization": f"Bearer {valid_proxy_api_key}"}
+
+    first_response = test_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={"model": "model", "input": "run it", "tools": [tool]},
+    )
+    assert first_response.status_code == 200
+    first_call = first_response.json()["output"][0]
+    assert first_call["type"] == "custom_tool_call"
+    assert first_call["call_id"] == "call-custom"
+
+    replay_response = test_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={
+            "model": "model",
+            "input": [
+                {"type": "message", "role": "user", "content": "run it"},
+                first_call,
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-custom",
+                    "output": "raw result",
+                },
+            ],
+            "tools": [tool],
+        },
+    )
+    assert replay_response.status_code == 200
+    assert replay_response.json()["output"][0]["content"][0]["text"] == "accepted"
+
+    replay_payload = transport.payloads[1]["conversationState"]
+    replay_assistant = replay_payload["history"][1]["assistantResponseMessage"]
+    assert replay_assistant["toolUses"] == [
+        {
+            "name": "freeform",
+            "input": {"input": "raw command"},
+            "toolUseId": "call-custom",
+        }
+    ]
+    replay_result = replay_payload["currentMessage"]["userInputMessage"][
+        "userInputMessageContext"
+    ]["toolResults"][0]
+    assert replay_result["toolUseId"] == "call-custom"
+    assert replay_result["content"] == [{"text": "raw result"}]
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"type": "web_search_preview"},
+        {"type": "image_generation"},
+        {"type": "mcp", "server_url": "https://example.test/mcp"},
+        {"type": "file_search"},
+        {"type": "computer_use_preview"},
+        {"type": "tool_search", "execution": "server"},
+        {"type": "unknown_client_tool"},
+    ],
+)
+def test_responses_high_level_seam_rejects_hosted_or_unknown_tools_before_kiro(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+    tool: Dict[str, Any],
+) -> None:
+    """Rejected tool capabilities never reach the isolated Kiro transport."""
+    from main import app
+
+    transport = KiroResponsesTransport()
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "tools": [tool]},
+    )
+
+    assert response.status_code == 400
+    message = str(response.json()["detail"])
+    if tool["type"] == "unknown_client_tool":
+        assert "Supported Client Tool types" in message
+    else:
+        assert "not supported" in message
+    assert transport.payloads == []

@@ -12,7 +12,11 @@ from loguru import logger
 
 from kiro.config import KIRO_MAX_PAYLOAD_BYTES
 from kiro.converters_core import KiroPayloadResult, build_kiro_payload
-from kiro.converters_responses import ResponsesConversionError, ResponsesRequestIR
+from kiro.converters_responses import (
+    ResponsesConversionError,
+    ResponsesRequestIR,
+    ResponsesToolIR,
+)
 from kiro.models_responses import ResponsesRequest
 from kiro.payload_guards import check_payload_size
 from kiro.streaming_core import StreamResult, calculate_tokens_from_context_usage
@@ -231,6 +235,76 @@ def generate_response_id() -> str:
     return f"resp_{uuid.uuid4().hex}"
 
 
+def _build_client_tool_output(
+    registration: ResponsesToolIR,
+    item_id: str,
+    call_id: str,
+    name: str,
+    arguments: str,
+) -> Dict[str, Any]:
+    """Restore one Kiro function bridge to its registered Responses type."""
+    try:
+        parsed_arguments = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        raise ResponsesConversionError(
+            f"Kiro returned malformed arguments for Tool Call '{call_id}'"
+        ) from exc
+    if not isinstance(parsed_arguments, dict):
+        raise ResponsesConversionError(
+            f"Kiro returned non-object arguments for Tool Call '{call_id}'"
+        )
+
+    output: Dict[str, Any] = {
+        "id": item_id,
+        "status": "completed",
+        "call_id": call_id,
+    }
+    if registration.external_type == "function":
+        output.update(
+            {
+                "type": "function_call",
+                "name": name,
+                "arguments": arguments,
+            }
+        )
+        return output
+    if registration.external_type == "custom":
+        if set(parsed_arguments) != {"input"} or not isinstance(
+            parsed_arguments["input"], str
+        ):
+            raise ResponsesConversionError(
+                f"Custom Tool Call '{call_id}' must use exactly one string field 'input'"
+            )
+        output.update(
+            {
+                "type": "custom_tool_call",
+                "name": name,
+                "input": parsed_arguments["input"],
+            }
+        )
+        return output
+
+    output_type = {
+        "shell": "shell_call",
+        "local_shell": "local_shell_call",
+        "tool_search": "tool_search_call",
+        "apply_patch": "apply_patch_call",
+    }.get(registration.external_type)
+    if output_type is None:
+        raise ResponsesConversionError(
+            f"Unsupported registered Client Tool type '{registration.external_type}'"
+        )
+    output["type"] = output_type
+    if registration.external_type in {"shell", "local_shell"}:
+        output["action"] = parsed_arguments
+    elif registration.external_type == "tool_search":
+        output["arguments"] = parsed_arguments
+        output["execution"] = registration.execution or "client"
+    else:
+        output["operation"] = parsed_arguments
+    return output
+
+
 def build_responses_object(
     request: ResponsesRequest,
     request_ir: ResponsesRequestIR,
@@ -309,12 +383,6 @@ def build_responses_object(
             raise ResponsesConversionError(
                 f"Kiro returned Tool Call '{call_id}' without a function name"
             )
-        registered_tool_names = {registered.name for registered in request_ir.tools}
-        if registered_tool_names and name not in registered_tool_names:
-            raise ResponsesConversionError(
-                f"Kiro returned unregistered Tool Call '{name}'; "
-                "check the Client Tool registry and retry"
-            )
         arguments = function.get("arguments")
         if arguments is None or arguments == "":
             arguments = "{}"
@@ -334,15 +402,30 @@ def build_responses_object(
             raise ResponsesConversionError(
                 f"Kiro returned non-object arguments for Tool Call '{call_id}'"
             )
+        registered_tool = request_ir.tool_registry.by_call_id.get(call_id)
+        if registered_tool is None:
+            registered_tool = request_ir.tool_registry.by_name.get(name)
+            if registered_tool is None:
+                raise ResponsesConversionError(
+                    f"Kiro returned unregistered Tool Call '{name}' with call_id "
+                    f"'{call_id}'; check the Client Tool registry and retry"
+                )
+            request_ir.tool_registry.bind_call(call_id, registered_tool)
+        else:
+            if registered_tool.name != name:
+                raise ResponsesConversionError(
+                    f"Tool registry conflict for call_id '{call_id}': expected "
+                    f"'{registered_tool.name}', received '{name}'"
+                )
+        registered_tool = request_ir.tool_registry.resolve(call_id, name)
         output.append(
-            {
-                "id": _new_item_id("fc"),
-                "type": "function_call",
-                "status": "completed",
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-            }
+            _build_client_tool_output(
+                registered_tool,
+                _new_item_id("fc"),
+                call_id,
+                name,
+                arguments,
+            )
         )
 
     usage = estimate_responses_usage(result, request_ir, model_cache, request.model)
