@@ -570,6 +570,7 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
         raise ResponsesConversionError("input must contain at least one item")
 
     known_call_ids = set()
+    returned_call_ids = set()
     for item in items:
         if item.item_type == "function_call" and item.call_id:
             if item.call_id in known_call_ids:
@@ -583,6 +584,12 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
                     "function_call_output has no preceding function_call for call_id "
                     f"{item.call_id}"
                 )
+            if item.call_id in returned_call_ids:
+                raise ResponsesConversionError(
+                    "Duplicate function_call_output for call_id "
+                    f"{item.call_id}; send exactly one result for each Tool Call"
+                )
+            returned_call_ids.add(item.call_id)
 
     instruction_segments: List[str] = []
     instructions_text = _extract_instruction_text(request.instructions, "instructions")

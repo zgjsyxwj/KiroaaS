@@ -372,14 +372,18 @@ class AwsEventStreamParser:
         else:
             input_str = str(input_data) if input_data else ''
         
+        tool_use_id = data.get("toolUseId")
+        generated_id = not isinstance(tool_use_id, str) or not tool_use_id
         self.current_tool_call = {
-            "id": data.get('toolUseId', generate_tool_call_id()),
+            "id": tool_use_id if not generated_id else generate_tool_call_id(),
             "type": "function",
             "function": {
                 "name": data.get('name', ''),
                 "arguments": input_str
             }
         }
+        if generated_id:
+            self.current_tool_call["_generated_id"] = True
         
         if data.get('stop'):
             self._finalize_tool_call()
@@ -554,19 +558,20 @@ class AwsEventStreamParser:
         # Doesn't look truncated, probably just malformed
         return {"is_truncated": False, "reason": "malformed JSON", "size_bytes": size_bytes}
     
-    def get_tool_calls(self) -> List[Dict[str, Any]]:
+    def get_tool_calls(self, deduplicate: bool = True) -> List[Dict[str, Any]]:
         """
         Returns all collected tool calls.
-        
+
         Finalizes current tool call if not finished.
-        Removes duplicates.
+        Removes duplicates by default. Responses can disable this because
+        identical parallel Client Tools still represent independent calls.
         
         Returns:
-            List of unique tool calls
+            List of collected tool calls, optionally deduplicated
         """
         if self.current_tool_call:
             self._finalize_tool_call()
-        return deduplicate_tool_calls(self.tool_calls)
+        return deduplicate_tool_calls(self.tool_calls) if deduplicate else list(self.tool_calls)
     
     def reset(self) -> None:
         """Resets parser state."""

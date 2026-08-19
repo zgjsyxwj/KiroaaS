@@ -118,7 +118,8 @@ class FirstTokenTimeoutError(Exception):
 async def parse_kiro_stream(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    deduplicate_result_tool_calls: bool = True,
 ) -> AsyncGenerator[KiroEvent, None]:
     """
     Parses Kiro SSE stream and yields unified events.
@@ -208,7 +209,9 @@ async def parse_kiro_stream(
                 logger.debug("Thinking block processing completed")
         
         # Check bracket-style tool calls in accumulated content
-        all_tool_calls = parser.get_tool_calls()
+        all_tool_calls = parser.get_tool_calls(
+            deduplicate=deduplicate_result_tool_calls
+        )
         # Note: bracket tool calls are checked by the caller using full content
         
         # Yield tool calls if any
@@ -289,7 +292,8 @@ async def _process_chunk(
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    deduplicate_result_tool_calls: bool = True,
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
@@ -308,7 +312,12 @@ async def collect_stream_to_result(
     result = StreamResult()
     full_content_for_bracket_tools = ""
     
-    async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser):
+    async for event in parse_kiro_stream(
+        response,
+        first_token_timeout,
+        enable_thinking_parser,
+        deduplicate_result_tool_calls,
+    ):
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
@@ -325,7 +334,12 @@ async def collect_stream_to_result(
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
-        result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
+        combined_tool_calls = result.tool_calls + bracket_tool_calls
+        result.tool_calls = (
+            deduplicate_tool_calls(combined_tool_calls)
+            if deduplicate_result_tool_calls
+            else combined_tool_calls
+        )
     
     return result
 

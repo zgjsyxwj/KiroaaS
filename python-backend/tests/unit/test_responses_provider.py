@@ -251,6 +251,31 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
             ResponsesRequest(model="model", input="hello", parallel_tool_calls=False)
         )
 
+    with pytest.raises(ResponsesConversionError, match="Duplicate function_call_output"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "run",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "first",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "duplicate",
+                    },
+                ],
+            )
+        )
+
     with pytest.raises(ResponsesConversionError, match="base64"):
         convert_responses_request(
             ResponsesRequest(

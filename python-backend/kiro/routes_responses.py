@@ -223,14 +223,31 @@ async def create_response(request: Request, request_data: ResponsesRequest) -> J
                     },
                 )
 
-            stream_result = await collect_stream_to_result(upstream_response)
-            response_body = build_responses_object(
-                request_data,
-                request_ir,
-                stream_result,
-                account.model_cache,
-                response_id=response_id,
+            stream_result = await collect_stream_to_result(
+                upstream_response,
+                deduplicate_result_tool_calls=False,
             )
+            try:
+                response_body = build_responses_object(
+                    request_data,
+                    request_ir,
+                    stream_result,
+                    account.model_cache,
+                    response_id=response_id,
+                )
+            except ResponsesConversionError as exc:
+                if debug_logger:
+                    debug_logger.flush_on_error(502, str(exc))
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": str(exc),
+                            "type": "kiro_protocol_error",
+                            "code": 502,
+                        }
+                    },
+                )
             await account_manager.report_success(account.id, request_data.model)
             if debug_logger:
                 debug_logger.discard_buffers()

@@ -26,31 +26,40 @@ class StubKiroStream(httpx.AsyncByteStream):
 class KiroResponsesTransport(httpx.AsyncBaseTransport):
     """Capture the Kiro payload and return isolated AWS Event Stream bytes."""
 
-    def __init__(self, status_code: int = 200, error_body: bytes = b"") -> None:
+    def __init__(
+        self,
+        status_code: int = 200,
+        error_body: bytes = b"",
+        event_batches: Optional[List[List[dict]]] = None,
+    ) -> None:
         self.payload: Optional[dict] = None
+        self.payloads: List[dict] = []
         self.status_code = status_code
         self.error_body = error_body
+        self.event_batches = event_batches
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.payload = json.loads(request.content)
+        self.payloads.append(self.payload)
         if self.status_code != 200:
             return httpx.Response(
                 self.status_code,
                 request=request,
                 content=self.error_body or b'{"message":"stub upstream failure"}',
             )
-        frames = [
-            _aws_event_frame(event)
-            for event in (
+        if self.event_batches:
+            batch_index = min(len(self.payloads) - 1, len(self.event_batches) - 1)
+            events = self.event_batches[batch_index]
+        else:
+            events = [
                 {"content": "Hello "},
                 {"content": "world"},
                 {"content": "你好"},
                 {"usage": 1.2},
                 {"contextUsagePercentage": 10.0},
-            )
-        ]
+            ]
+        frames = [_aws_event_frame(event) for event in events]
         wire = b"".join(frames)
-        utf8_start = wire.index("你好".encode("utf-8"))
         frame_boundaries = {0, len(wire), 5, 17, 31, 47, 63}
         offset = 0
         for frame in frames:
@@ -71,14 +80,16 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
                 }
             )
             offset += len(frame)
-        frame_boundaries.update(
-            {
-                utf8_start + 1,
-                utf8_start + 2,
-                utf8_start + 4,
-                utf8_start + 5,
-            }
-        )
+        if "你好".encode("utf-8") in wire:
+            utf8_start = wire.index("你好".encode("utf-8"))
+            frame_boundaries.update(
+                {
+                    utf8_start + 1,
+                    utf8_start + 2,
+                    utf8_start + 4,
+                    utf8_start + 5,
+                }
+            )
         split_points = tuple(sorted(point for point in frame_boundaries if point < len(wire))) + (len(wire),)
         stream = StubKiroStream(
             [wire[start:end] for start, end in zip(split_points, split_points[1:])]
@@ -419,3 +430,363 @@ def test_responses_high_level_seam_returns_validation_error_for_malformed_input(
     )
 
     assert response.status_code == 422
+
+
+def test_responses_client_tool_loop_preserves_call_id_and_sanitizes_schema(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A client tool call can be replayed with its result through the HTTP seam."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "get_weather",
+                    "toolUseId": "kiro-call-1",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                }
+            ],
+            [{"content": "The weather result was accepted."}],
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+
+    tool = {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get the current weather.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        },
+    }
+    first_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "What is the weather?", "tools": [tool]},
+    )
+
+    assert first_response.status_code == 200
+    first_body = first_response.json()
+    call = first_body["output"][0]
+    assert call["type"] == "function_call"
+    assert call["call_id"] == "kiro-call-1"
+    assert call["name"] == "get_weather"
+    assert call["arguments"] == '{"city": "Taipei"}'
+
+    first_payload = transport.payloads[0]
+    kiro_tool = first_payload["conversationState"]["currentMessage"][
+        "userInputMessage"
+    ]["userInputMessageContext"]["tools"][0]["toolSpecification"]
+    assert kiro_tool["name"] == "get_weather"
+    assert "additionalProperties" not in kiro_tool["inputSchema"]["json"]
+
+    replay_input = [
+        {"type": "message", "role": "user", "content": "What is the weather?"},
+        {
+            "type": "function_call",
+            "call_id": call["call_id"],
+            "name": call["name"],
+            "arguments": call["arguments"],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": call["call_id"],
+            "output": '{"temperature":26}',
+        },
+    ]
+    second_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": replay_input, "tools": [tool]},
+    )
+
+    assert second_response.status_code == 200
+    assert second_response.json()["output"][0]["content"][0]["text"] == (
+        "The weather result was accepted."
+    )
+    replay_payload = transport.payloads[1]
+    replay_history = replay_payload["conversationState"]["history"]
+    replay_assistant = replay_history[1]["assistantResponseMessage"]
+    assert replay_assistant["toolUses"][0]["toolUseId"] == call["call_id"]
+    replay_current = replay_payload["conversationState"]["currentMessage"][
+        "userInputMessage"
+    ]
+    replay_results = replay_current["userInputMessageContext"]["toolResults"]
+    assert replay_results[0]["toolUseId"] == call["call_id"]
+    assert replay_results[0]["content"] == [{"text": '{"temperature":26}'}]
+
+
+def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Parallel Tool Calls retain independent IDs and client result order."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "lookup_city",
+                    "toolUseId": "call-city",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                },
+                {
+                    "name": "lookup_timezone",
+                    "toolUseId": "call-timezone",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                },
+            ],
+            [{"content": "Both results received."}],
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    tools = [
+        {
+            "type": "function",
+            "name": "lookup_city",
+            "parameters": {"type": "object"},
+        },
+        {
+            "type": "function",
+            "name": "lookup_timezone",
+            "parameters": {"type": "object"},
+        },
+    ]
+
+    first_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "Look these up.", "tools": tools},
+    )
+    assert first_response.status_code == 200
+    calls = first_response.json()["output"]
+    assert [item["call_id"] for item in calls] == ["call-city", "call-timezone"]
+    assert [item["name"] for item in calls] == ["lookup_city", "lookup_timezone"]
+
+    replay_input = [
+        {"type": "message", "role": "user", "content": "Look these up."},
+        {
+            "type": "function_call",
+            "call_id": "call-city",
+            "name": "lookup_city",
+            "arguments": '{"city":"Taipei"}',
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-timezone",
+            "name": "lookup_timezone",
+            "arguments": '{"city":"Taipei"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-timezone",
+            "output": "UTC+8",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-city",
+            "output": "Taipei, Taiwan",
+        },
+    ]
+    second_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": replay_input, "tools": tools},
+    )
+
+    assert second_response.status_code == 200
+    replay_payload = transport.payloads[1]
+    replay_current = replay_payload["conversationState"]["currentMessage"][
+        "userInputMessage"
+    ]
+    replay_results = replay_current["userInputMessageContext"]["toolResults"]
+    assert [item["toolUseId"] for item in replay_results] == [
+        "call-timezone",
+        "call-city",
+    ]
+
+
+def test_responses_missing_kiro_call_ids_are_request_scoped_and_ordered(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Missing upstream IDs receive unique IDs stable within one response only."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {"name": "run", "input": "{}", "stop": True},
+                {"name": "run", "input": "{}", "stop": True},
+            ],
+            [{"name": "run", "input": "{}", "stop": True}],
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    request = {
+        "model": "model",
+        "input": "Run twice.",
+        "tools": [{"type": "function", "name": "run", "parameters": {}}],
+    }
+
+    first_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json=request,
+    )
+    second_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json=request,
+    )
+
+    first_ids = [item["call_id"] for item in first_response.json()["output"]]
+    second_ids = [item["call_id"] for item in second_response.json()["output"]]
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert len(first_ids) == 2
+    assert len(set(first_ids)) == 2
+    assert first_ids[0] != first_ids[1]
+    assert set(first_ids).isdisjoint(second_ids)
+
+
+def test_responses_text_and_tool_output_items_keep_stable_order(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Mixed Kiro text and Tool Call output uses response array order."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {"content": "Before tool. "},
+                {
+                    "name": "run",
+                    "toolUseId": "call-mixed",
+                    "input": "{}",
+                    "stop": True,
+                },
+                {"content": "After tool."},
+            ]
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": "Do it.",
+            "tools": [{"type": "function", "name": "run", "parameters": {}}],
+        },
+    )
+
+    assert response.status_code == 200
+    output = response.json()["output"]
+    assert [item["type"] for item in output] == ["message", "function_call"]
+    assert output[0]["content"][0]["text"] == "Before tool. After tool."
+    assert output[1]["call_id"] == "call-mixed"
+
+
+def test_responses_rejects_duplicate_kiro_tool_call_ids_actionably(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """Duplicate upstream IDs never produce cross-wired Responses output."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "first",
+                    "toolUseId": "duplicate-call",
+                    "input": "{}",
+                    "stop": True,
+                },
+                {
+                    "name": "second",
+                    "toolUseId": "duplicate-call",
+                    "input": "{}",
+                    "stop": True,
+                },
+            ]
+        ]
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": "Run both.",
+            "tools": [
+                {"type": "function", "name": "first", "parameters": {}},
+                {"type": "function", "name": "second", "parameters": {}},
+            ],
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "kiro_protocol_error"
+    assert "duplicate" in response.json()["error"]["message"].lower()

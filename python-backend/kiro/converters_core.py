@@ -1031,10 +1031,21 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
         # Check if this message has tool_results
         if msg.tool_results:
             # Check if the previous message is an assistant with tool_calls
-            has_preceding_assistant = (
-                result and
-                result[-1].role == "assistant" and
-                result[-1].tool_calls
+            has_preceding_assistant = bool(
+                result
+                and (
+                    (
+                        result[-1].role == "assistant"
+                        and result[-1].tool_calls
+                    )
+                    or (
+                        result[-1].role == "user"
+                        and result[-1].tool_results
+                        and len(result) > 1
+                        and result[-2].role == "assistant"
+                        and result[-2].tool_calls
+                    )
+                )
             )
             
             if not has_preceding_assistant:

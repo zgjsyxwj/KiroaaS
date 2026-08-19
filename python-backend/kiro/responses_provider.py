@@ -2,6 +2,7 @@
 
 """Non-streaming Responses provider primitives."""
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from kiro.models_responses import ResponsesRequest
 from kiro.payload_guards import check_payload_size
 from kiro.streaming_core import StreamResult, calculate_tokens_from_context_usage
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.utils import generate_conversation_id, generate_tool_call_id
+from kiro.utils import generate_conversation_id
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,30 @@ def _new_item_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _new_request_scoped_call_id(
+    response_id: str,
+    output_index: int,
+    used_call_ids: set[str],
+) -> str:
+    """Create a stable call ID for one missing upstream Tool Call ID.
+
+    Args:
+        response_id: Identity of the current HTTP Responses request.
+        output_index: Stable position of the Tool Call in the Kiro result.
+        used_call_ids: IDs already assigned in this response.
+
+    Returns:
+        A unique call ID scoped to this response and output position.
+    """
+    response_token = response_id.removeprefix("resp_")
+    candidate = f"call_{response_token}_{output_index}"
+    suffix = 1
+    while candidate in used_call_ids:
+        candidate = f"call_{response_token}_{output_index}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def generate_response_id() -> str:
     """Create a new Responses identity for one HTTP request."""
     return f"resp_{uuid.uuid4().hex}"
@@ -250,22 +275,61 @@ def build_responses_object(
         )
 
     seen_call_ids: set[str] = set()
-    for tool in result.tool_calls:
+    for output_index, tool in enumerate(result.tool_calls):
         function = tool.get("function") or {}
-        call_id = tool.get("id") or generate_tool_call_id()
-        while call_id in seen_call_ids:
-            call_id = generate_tool_call_id()
+        if tool.get("_truncation_detected"):
+            raise ResponsesConversionError(
+                "Kiro returned truncated Tool Call arguments; retry the request "
+                "or reduce the tool input and context"
+            )
+        call_id = tool.get("id")
+        if tool.get("_generated_id") or not call_id:
+            call_id = _new_request_scoped_call_id(
+                response_id,
+                output_index,
+                seen_call_ids,
+            )
+        if not isinstance(call_id, str) or not call_id:
+            raise ResponsesConversionError(
+                "Kiro returned a Tool Call without a usable call_id"
+            )
+        if call_id in seen_call_ids:
+            raise ResponsesConversionError(
+                f"Kiro returned duplicate Tool Call call_id '{call_id}'; "
+                "retry the request or report the upstream response"
+            )
         seen_call_ids.add(call_id)
-        arguments = function.get("arguments") or "{}"
-        if not isinstance(arguments, str):
-            arguments = str(arguments)
+        name = function.get("name") or tool.get("name")
+        if not isinstance(name, str) or not name:
+            raise ResponsesConversionError(
+                f"Kiro returned Tool Call '{call_id}' without a function name"
+            )
+        arguments = function.get("arguments")
+        if arguments is None or arguments == "":
+            arguments = "{}"
+        elif isinstance(arguments, (dict, list)):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        elif not isinstance(arguments, str):
+            raise ResponsesConversionError(
+                f"Kiro returned malformed arguments for Tool Call '{call_id}'"
+            )
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ResponsesConversionError(
+                f"Kiro returned malformed arguments for Tool Call '{call_id}'"
+            ) from exc
+        if not isinstance(parsed_arguments, dict):
+            raise ResponsesConversionError(
+                f"Kiro returned non-object arguments for Tool Call '{call_id}'"
+            )
         output.append(
             {
                 "id": _new_item_id("fc"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call_id,
-                "name": function.get("name") or tool.get("name") or "",
+                "name": name,
                 "arguments": arguments,
             }
         )
