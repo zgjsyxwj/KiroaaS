@@ -758,7 +758,7 @@ class TestAwsEventStreamParserFinalizeToolCall:
         
         print("Action: Finalizing tool call...")
         aws_event_parser._finalize_tool_call()
-        
+
         print(f"Result: {aws_event_parser.tool_calls}")
         assert len(aws_event_parser.tool_calls) == 1
         assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
@@ -774,16 +774,17 @@ class TestAwsEventStreamParserFinalizeToolCall:
             "type": "function",
             "function": {
                 "name": "test_func",
-                "arguments": "not valid json {"
+                "arguments": "not valid json"
             }
         }
         
         print("Action: Finalizing tool call...")
         aws_event_parser._finalize_tool_call()
-        
+
         print(f"Result: {aws_event_parser.tool_calls}")
         assert len(aws_event_parser.tool_calls) == 1
         assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
+        assert aws_event_parser.tool_calls[0]["_malformed_arguments"] is True
     
     def test_finalize_with_none_current_tool_call(self, aws_event_parser):
         """

@@ -239,6 +239,7 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
                         "output": "result",
                     }
                 ],
+                tools=[{"type": "function", "name": "run", "parameters": {}}],
             )
         )
 
@@ -274,6 +275,7 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
                         "output": "duplicate",
                     },
                 ],
+                tools=[{"type": "function", "name": "run", "parameters": {}}],
             )
         )
 
@@ -289,6 +291,7 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
                         "arguments": "{}",
                     }
                 ],
+                tools=[{"type": "function", "name": "run", "parameters": {}}],
             )
         )
 
@@ -348,6 +351,30 @@ def test_responses_rejects_malformed_replayed_function_arguments():
                         "call_id": "call_1",
                         "name": "run",
                         "arguments": "{not-json",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "done",
+                    },
+                ],
+                tools=[{"type": "function", "name": "run", "parameters": {}}],
+            )
+        )
+
+
+def test_responses_rejects_tool_replay_without_complete_tool_registry():
+    """Tool replay requires the client to resend its function definitions."""
+    with pytest.raises(ResponsesConversionError, match="corresponding function definitions"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "run",
+                        "arguments": "{}",
                     },
                     {
                         "type": "function_call_output",
@@ -438,6 +465,33 @@ def test_responses_output_rejects_malformed_kiro_tool_calls(
             StreamResult(tool_calls=[tool_call]),
             model_cache=None,
             response_id="resp_malformed",
+        )
+
+
+def test_responses_output_rejects_unregistered_kiro_tool_call():
+    """Kiro cannot emit a Tool Call outside the registered Client Tool set."""
+    request = ResponsesRequest(
+        model="model",
+        input="run",
+        tools=[{"type": "function", "name": "registered", "parameters": {}}],
+    )
+    request_ir = convert_responses_request(request)
+
+    with pytest.raises(ResponsesConversionError, match="unregistered Tool Call"):
+        build_responses_object(
+            request,
+            request_ir,
+            StreamResult(
+                tool_calls=[
+                    {
+                        "id": "call_unknown",
+                        "type": "function",
+                        "function": {"name": "unknown", "arguments": "{}"},
+                    }
+                ]
+            ),
+            model_cache=None,
+            response_id="resp_unknown",
         )
 
 

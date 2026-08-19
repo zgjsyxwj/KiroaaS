@@ -570,6 +570,16 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
         raise ResponsesConversionError("input must contain at least one item")
 
     response_tools = _convert_tools(request.tools)
+    replayed_tool_items = {
+        item.item_type
+        for item in items
+        if item.item_type in {"function_call", "function_call_output"}
+    }
+    if replayed_tool_items and not response_tools:
+        raise ResponsesConversionError(
+            "Tool Call replay requires the corresponding function definitions "
+            "in the tools field; resend the complete Client Tool registry"
+        )
     registered_tool_names = {tool.name for tool in response_tools}
     known_call_ids = set()
     returned_call_ids = set()

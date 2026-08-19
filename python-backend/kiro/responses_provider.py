@@ -309,6 +309,12 @@ def build_responses_object(
             raise ResponsesConversionError(
                 f"Kiro returned Tool Call '{call_id}' without a function name"
             )
+        registered_tool_names = {registered.name for registered in request_ir.tools}
+        if registered_tool_names and name not in registered_tool_names:
+            raise ResponsesConversionError(
+                f"Kiro returned unregistered Tool Call '{name}'; "
+                "check the Client Tool registry and retry"
+            )
         arguments = function.get("arguments")
         if arguments is None or arguments == "":
             arguments = "{}"

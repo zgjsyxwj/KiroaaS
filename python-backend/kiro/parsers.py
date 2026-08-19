@@ -355,7 +355,16 @@ class AwsEventStreamParser:
         return {"type": "content", "data": content}
     
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes tool call start."""
+        """Process one Kiro Tool Call start event.
+
+        Args:
+            data: Decoded Kiro event containing the tool name, optional ID,
+                and optional initial argument fragment.
+
+        Returns:
+            No event. The parser stores the incomplete Tool Call until its
+            stop event or the end of the stream.
+        """
         # Finalize previous tool call if exists
         if self.current_tool_call:
             self._finalize_tool_call()
@@ -384,6 +393,10 @@ class AwsEventStreamParser:
         }
         if generated_id:
             self.current_tool_call["_generated_id"] = True
+            logger.debug(
+                "Kiro Tool Call omitted toolUseId; generated temporary parser ID={}",
+                self.current_tool_call["id"],
+            )
         
         if data.get('stop'):
             self._finalize_tool_call()
