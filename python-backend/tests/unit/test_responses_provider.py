@@ -424,8 +424,13 @@ def test_responses_output_omits_empty_message_and_preserves_tool_call_ids():
     assert body["usage"]["total_tokens"] > 0
 
 
-def test_responses_custom_tool_bridges_raw_input_and_restores_custom_call():
-    """Custom tools use a single Kiro input field and keep raw Responses input."""
+def test_responses_custom_tool_bridges_raw_input_and_restores_custom_call() -> None:
+    """Custom tools use a single Kiro input field and keep raw Responses input.
+
+    What it does: Converts a raw custom input through the Kiro bridge.
+    Purpose: Verify Responses restores the raw string and custom output type.
+    """
+    print("Testing custom raw-string bridge")
     request = ResponsesRequest(
         model="model",
         input="apply a patch",
@@ -513,7 +518,12 @@ def test_responses_client_tool_types_are_restored_after_kiro_bridge(
     expected_type: str,
     expected_field: tuple[str, Any],
 ) -> None:
-    """Supported Codex Client Tools never collapse into generic function output."""
+    """Supported Codex Client Tools never collapse into generic function output.
+
+    What it does: Converts each supported Client Tool through the output path.
+    Purpose: Verify shell, local-shell, search, and patch types remain typed.
+    """
+    print(f"Testing {tool['type']} output restoration")
     request = ResponsesRequest(model="model", input="run", tools=[tool])
     request_ir = convert_responses_request(request)
     assert request_ir.tools[0].external_type == tool["type"]
@@ -540,8 +550,13 @@ def test_responses_client_tool_types_are_restored_after_kiro_bridge(
     assert output[expected_field[0]] == expected_field[1]
 
 
-def test_responses_custom_tool_replay_uses_raw_input_and_registered_call_id():
-    """Custom replay converts only at the Kiro boundary and keeps the call ID."""
+def test_responses_custom_tool_replay_uses_raw_input_and_registered_call_id() -> None:
+    """Custom replay converts only at the Kiro boundary and keeps the call ID.
+
+    What it does: Converts a custom call/result replay pair.
+    Purpose: Verify the Kiro bridge receives one input field and the original ID.
+    """
+    print("Testing custom replay identity")
     request = ResponsesRequest(
         model="model",
         input=[
@@ -569,8 +584,85 @@ def test_responses_custom_tool_replay_uses_raw_input_and_registered_call_id():
     assert request_ir.messages[1].tool_results[0]["tool_use_id"] == "call-custom"
 
 
-def test_responses_tool_registry_rejects_duplicate_and_conflicting_definitions():
-    """Duplicate names and type changes fail before Kiro receives a payload."""
+def test_responses_tool_search_result_preserves_official_tools_field() -> None:
+    """Tool-search results keep the structured tools list in Kiro history.
+
+    What it does: Replays a tool-search result using its ``tools`` field.
+    Purpose: Verify the result is not reduced to an empty generic function result.
+    """
+    print("Testing tool-search result preservation")
+    request = ResponsesRequest(
+        model="model",
+        input=[
+            {
+                "type": "tool_search_call",
+                "call_id": "call-search",
+                "arguments": {"query": "browser"},
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "call-search",
+                "tools": [{"type": "function", "name": "browser"}],
+            },
+        ],
+        tools=[{"type": "tool_search", "execution": "client"}],
+    )
+
+    request_ir = convert_responses_request(request)
+
+    assert request_ir.messages[1].tool_results[0]["content"] == (
+        '[{"type": "function", "name": "browser"}]'
+    )
+
+
+def test_responses_rejects_replayed_execution_ownership_changes() -> None:
+    """Replay cannot change a Client Tool into Hosted execution.
+
+    What it does: Replays server-owned search and invalid custom execution.
+    Purpose: Verify execution ownership is rejected instead of silently ignored.
+    """
+    print("Testing replay execution ownership validation")
+    with pytest.raises(ResponsesConversionError, match="Hosted Tool"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "tool_search_call",
+                        "call_id": "call-search",
+                        "arguments": {"query": "browser"},
+                        "execution": "server",
+                    }
+                ],
+                tools=[{"type": "tool_search", "execution": "client"}],
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="does not support"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call-custom",
+                        "name": "run",
+                        "input": "hello",
+                        "execution": "client",
+                    }
+                ],
+                tools=[{"type": "custom", "name": "run"}],
+            )
+        )
+
+
+def test_responses_tool_registry_rejects_duplicate_and_conflicting_definitions() -> None:
+    """Duplicate names and type changes fail before Kiro receives a payload.
+
+    What it does: Registers duplicate and conflicting tool definitions.
+    Purpose: Verify registry behavior is deterministic before network dispatch.
+    """
+    print("Testing duplicate and conflicting registry definitions")
     with pytest.raises(ResponsesConversionError, match="Duplicate Client Tool"):
         convert_responses_request(
             ResponsesRequest(
@@ -596,8 +688,13 @@ def test_responses_tool_registry_rejects_duplicate_and_conflicting_definitions()
         )
 
 
-def test_responses_rejects_unknown_and_malformed_client_tools_actionably():
-    """Unknown types list supported choices and custom input stays a string."""
+def test_responses_rejects_unknown_and_malformed_client_tools_actionably() -> None:
+    """Unknown types list supported choices and custom input stays a string.
+
+    What it does: Submits an unknown type and malformed custom input.
+    Purpose: Verify failures explain the supported choices and required shape.
+    """
+    print("Testing actionable malformed Client Tool errors")
     with pytest.raises(ResponsesConversionError, match="Supported Client Tool types"):
         convert_responses_request(
             ResponsesRequest(
@@ -629,8 +726,13 @@ def test_responses_rejects_unknown_and_malformed_client_tools_actionably():
         )
 
 
-def test_responses_custom_tool_output_rejects_invalid_bridge_shape():
-    """A malformed Kiro custom bridge cannot become a valid custom Tool Call."""
+def test_responses_custom_tool_output_rejects_invalid_bridge_shape() -> None:
+    """A malformed Kiro custom bridge cannot become a valid custom Tool Call.
+
+    What it does: Supplies extra fields in the Kiro custom bridge object.
+    Purpose: Verify raw custom output requires exactly one string input field.
+    """
+    print("Testing malformed custom bridge rejection")
     request = ResponsesRequest(
         model="model",
         input="run",
@@ -659,8 +761,13 @@ def test_responses_custom_tool_output_rejects_invalid_bridge_shape():
         )
 
 
-def test_responses_registry_keeps_parallel_same_name_calls_by_call_id():
-    """Parallel calls to one registered tool cannot overwrite each other."""
+def test_responses_registry_keeps_parallel_same_name_calls_by_call_id() -> None:
+    """Parallel calls to one registered tool cannot overwrite each other.
+
+    What it does: Builds two same-name calls with distinct call IDs.
+    Purpose: Verify identity tracking prevents parallel calls from crossing.
+    """
+    print("Testing parallel same-name call identity")
     request = ResponsesRequest(
         model="model",
         input="run twice",

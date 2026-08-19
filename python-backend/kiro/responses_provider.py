@@ -235,14 +235,19 @@ def generate_response_id() -> str:
     return f"resp_{uuid.uuid4().hex}"
 
 
-def _build_client_tool_output(
-    registration: ResponsesToolIR,
-    item_id: str,
-    call_id: str,
-    name: str,
-    arguments: str,
-) -> Dict[str, Any]:
-    """Restore one Kiro function bridge to its registered Responses type."""
+def _parse_kiro_tool_arguments(arguments: str, call_id: str) -> Dict[str, Any]:
+    """Parse one Kiro Tool Call bridge as a JSON object.
+
+    Args:
+        arguments: JSON text returned in the Kiro function bridge.
+        call_id: Tool Call identity used in validation errors.
+
+    Returns:
+        Parsed object arguments shared by the typed output adapter.
+
+    Raises:
+        ResponsesConversionError: If the bridge is invalid or not an object.
+    """
     try:
         parsed_arguments = json.loads(arguments)
     except json.JSONDecodeError as exc:
@@ -253,7 +258,34 @@ def _build_client_tool_output(
         raise ResponsesConversionError(
             f"Kiro returned non-object arguments for Tool Call '{call_id}'"
         )
+    return parsed_arguments
 
+
+def _build_client_tool_output(
+    registration: ResponsesToolIR,
+    item_id: str,
+    call_id: str,
+    name: str,
+    arguments: str,
+    parsed_arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Restore one Kiro function bridge to its registered Responses type.
+
+    Args:
+        registration: Client Tool record resolved from the request registry.
+        item_id: New Responses output item identity.
+        call_id: Original Tool Call identity from Kiro.
+        name: Tool name returned by Kiro.
+        arguments: Original JSON object text returned by Kiro.
+        parsed_arguments: JSON object returned by Kiro.
+
+    Returns:
+        A typed Responses Tool Call output item.
+
+    Raises:
+        ResponsesConversionError: If Kiro returned malformed JSON or a bridge
+            shape incompatible with the registered Client Tool type.
+    """
     output: Dict[str, Any] = {
         "id": item_id,
         "status": "completed",
@@ -314,9 +346,9 @@ def build_responses_object(
 ) -> Dict[str, Any]:
     """Build one formal non-streaming Responses object.
 
-    Empty generated messages are omitted. Tool calls are represented as
-    ``function_call`` output items and retain their upstream call IDs, while
-    missing IDs receive a new ID local to this response.
+    Empty generated messages are omitted. Tool calls are restored to their
+    registered Responses Client Tool types and retain their upstream call IDs,
+    while missing IDs receive a new ID local to this response.
 
     Args:
         request: Original Responses request for echo fields.
@@ -392,32 +424,8 @@ def build_responses_object(
             raise ResponsesConversionError(
                 f"Kiro returned malformed arguments for Tool Call '{call_id}'"
             )
-        try:
-            parsed_arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise ResponsesConversionError(
-                f"Kiro returned malformed arguments for Tool Call '{call_id}'"
-            ) from exc
-        if not isinstance(parsed_arguments, dict):
-            raise ResponsesConversionError(
-                f"Kiro returned non-object arguments for Tool Call '{call_id}'"
-            )
-        registered_tool = request_ir.tool_registry.by_call_id.get(call_id)
-        if registered_tool is None:
-            registered_tool = request_ir.tool_registry.by_name.get(name)
-            if registered_tool is None:
-                raise ResponsesConversionError(
-                    f"Kiro returned unregistered Tool Call '{name}' with call_id "
-                    f"'{call_id}'; check the Client Tool registry and retry"
-                )
-            request_ir.tool_registry.bind_call(call_id, registered_tool)
-        else:
-            if registered_tool.name != name:
-                raise ResponsesConversionError(
-                    f"Tool registry conflict for call_id '{call_id}': expected "
-                    f"'{registered_tool.name}', received '{name}'"
-                )
-        registered_tool = request_ir.tool_registry.resolve(call_id, name)
+        parsed_arguments = _parse_kiro_tool_arguments(arguments, call_id)
+        registered_tool = request_ir.tool_registry.resolve_or_bind(call_id, name)
         output.append(
             _build_client_tool_output(
                 registered_tool,
@@ -425,6 +433,7 @@ def build_responses_object(
                 call_id,
                 name,
                 arguments,
+                parsed_arguments,
             )
         )
 

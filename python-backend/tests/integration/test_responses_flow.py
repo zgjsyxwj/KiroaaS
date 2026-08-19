@@ -820,7 +820,12 @@ def test_responses_high_level_seam_preserves_all_client_tool_types(
     valid_proxy_api_key: str,
     monkeypatch: Any,
 ) -> None:
-    """Every supported Client Tool survives the isolated Kiro bridge explicitly."""
+    """Every supported Client Tool survives the isolated Kiro bridge explicitly.
+
+    What it does: Sends mixed Client Tool definitions, calls, and results.
+    Purpose: Verify the network seam preserves each registered Responses type.
+    """
+    print("Testing mixed Client Tool definitions, calls, and results")
     from main import app
 
     transport = KiroResponsesTransport(
@@ -956,7 +961,7 @@ def test_responses_high_level_seam_preserves_all_client_tool_types(
         {
             "type": "tool_search_output",
             "call_id": "call-search",
-            "output": {"tools": []},
+            "tools": [{"type": "function", "name": "browser"}],
         },
         {
             "type": "apply_patch_call_output",
@@ -998,6 +1003,9 @@ def test_responses_high_level_seam_preserves_all_client_tool_types(
         "call-apply-patch",
         "call-function",
     ]
+    assert replay_results[3]["content"][0]["text"] == (
+        '[{"type": "function", "name": "browser"}]'
+    )
 
 
 def test_responses_high_level_seam_replays_custom_type_and_call_id(
@@ -1006,7 +1014,12 @@ def test_responses_high_level_seam_replays_custom_type_and_call_id(
     valid_proxy_api_key: str,
     monkeypatch: Any,
 ) -> None:
-    """Custom Tool Call and Result replay retain the registered type and identity."""
+    """Custom Tool Call and Result replay retain the registered type and identity.
+
+    What it does: Replays a custom call and its raw-string result over HTTP.
+    Purpose: Verify the original custom type and call ID survive both hops.
+    """
+    print("Testing custom Tool Call and Result replay")
     from main import app
 
     transport = KiroResponsesTransport(
@@ -1080,6 +1093,7 @@ def test_responses_high_level_seam_replays_custom_type_and_call_id(
         {"type": "image_generation"},
         {"type": "mcp", "server_url": "https://example.test/mcp"},
         {"type": "file_search"},
+        {"type": "computer_use"},
         {"type": "computer_use_preview"},
         {"type": "tool_search", "execution": "server"},
         {"type": "unknown_client_tool"},
@@ -1092,7 +1106,12 @@ def test_responses_high_level_seam_rejects_hosted_or_unknown_tools_before_kiro(
     monkeypatch: Any,
     tool: Dict[str, Any],
 ) -> None:
-    """Rejected tool capabilities never reach the isolated Kiro transport."""
+    """Rejected tool capabilities never reach the isolated Kiro transport.
+
+    What it does: Sends Hosted and unknown tool definitions to the endpoint.
+    Purpose: Verify unsupported capabilities fail before any upstream call.
+    """
+    print("Testing Hosted and unknown Client Tool rejection")
     from main import app
 
     transport = KiroResponsesTransport()

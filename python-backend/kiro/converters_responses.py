@@ -30,6 +30,7 @@ THINKING_BUDGETS: Dict[str, int] = {
 _HOSTED_TOOL_TYPES = {
     "code_interpreter",
     "computer",
+    "computer_use",
     "computer_use_preview",
     "file_search",
     "image_generation",
@@ -123,13 +124,25 @@ class ResponsesToolIR:
 
 @dataclass
 class ResponsesToolRegistry:
-    """Track registered Client Tools by name and Tool Call identity."""
+    """Track registered Client Tools by name and Tool Call identity.
+
+    The two indexes deliberately point to the same immutable tool records.
+    This makes name and call-ID lookups independently useful while still
+    allowing the registry to detect identity mismatches.
+    """
 
     by_name: Dict[str, ResponsesToolIR] = field(default_factory=dict)
     by_call_id: Dict[str, ResponsesToolIR] = field(default_factory=dict)
 
     def register(self, tool: ResponsesToolIR) -> None:
-        """Register one tool definition, rejecting duplicate names."""
+        """Register one tool definition, rejecting duplicate names.
+
+        Args:
+            tool: Client Tool definition to register.
+
+        Raises:
+            ResponsesConversionError: If the name is already registered.
+        """
         if tool.name in self.by_name:
             existing = self.by_name[tool.name]
             if existing.external_type != tool.external_type:
@@ -144,7 +157,15 @@ class ResponsesToolRegistry:
         self.by_name[tool.name] = tool
 
     def bind_call(self, call_id: str, tool: ResponsesToolIR) -> None:
-        """Bind a Tool Call identity to its registered Client Tool."""
+        """Bind a Tool Call identity to its registered Client Tool.
+
+        Args:
+            call_id: Client-visible Tool Call identity.
+            tool: Registered Client Tool associated with the call.
+
+        Raises:
+            ResponsesConversionError: If the call ID is already bound.
+        """
         existing = self.by_call_id.get(call_id)
         if existing is not None:
             if (
@@ -162,7 +183,19 @@ class ResponsesToolRegistry:
         self.by_call_id[call_id] = tool
 
     def resolve(self, call_id: str, name: str) -> ResponsesToolIR:
-        """Resolve one upstream Tool Call using identity first, then name."""
+        """Resolve one upstream Tool Call using identity and name.
+
+        Args:
+            call_id: Tool Call identity returned by Kiro.
+            name: Tool name returned by Kiro.
+
+        Returns:
+            The single registry record identified by both values.
+
+        Raises:
+            ResponsesConversionError: If either identity is missing or they
+                resolve to different records.
+        """
         by_call_id = self.by_call_id.get(call_id)
         by_name = self.by_name.get(name)
         if by_call_id is None or by_name is None:
@@ -175,6 +208,36 @@ class ResponsesToolRegistry:
                 f"Tool registry conflict for call_id '{call_id}' and name '{name}'"
             )
         return by_call_id
+
+    def resolve_or_bind(self, call_id: str, name: str) -> ResponsesToolIR:
+        """Resolve a Kiro Tool Call and bind a fresh call identity.
+
+        Args:
+            call_id: Tool Call identity returned by Kiro.
+            name: Tool name returned by Kiro.
+
+        Returns:
+            The registered Client Tool record.
+
+        Raises:
+            ResponsesConversionError: If the name is unknown or the call ID
+                conflicts with an existing registration.
+        """
+        registered_tool = self.by_call_id.get(call_id)
+        if registered_tool is None:
+            registered_tool = self.by_name.get(name)
+            if registered_tool is None:
+                raise ResponsesConversionError(
+                    f"Kiro returned unregistered Tool Call '{name}' with call_id "
+                    f"'{call_id}'; check the Client Tool registry and retry"
+                )
+            self.bind_call(call_id, registered_tool)
+        elif registered_tool.name != name:
+            raise ResponsesConversionError(
+                f"Tool registry conflict for call_id '{call_id}': expected "
+                f"'{registered_tool.name}', received '{name}'"
+            )
+        return self.resolve(call_id, name)
 
 
 @dataclass(frozen=True)
@@ -362,7 +425,19 @@ def _normalize_image_block(block: Dict[str, Any], field_name: str) -> Dict[str, 
 
 
 def _parse_tool_arguments(value: Any, call_id: str, tool_type: str) -> str:
-    """Normalize one replayed non-custom Client Tool payload to JSON."""
+    """Normalize one replayed non-custom Client Tool payload to JSON.
+
+    Args:
+        value: Raw action, arguments, or operation value from Responses.
+        call_id: Tool Call identity used in validation errors.
+        tool_type: Registered Client Tool type.
+
+    Returns:
+        A JSON string containing one object for the Kiro function bridge.
+
+    Raises:
+        ResponsesConversionError: If the value is not valid object JSON.
+    """
     arguments = "{}" if value is None else value
     if not isinstance(arguments, str):
         try:
@@ -398,11 +473,24 @@ def _convert_tool_call(
     item: ResponsesInputItem,
     tool_type: str,
 ) -> Dict[str, Any]:
-    """Convert one replayed Client Tool Call to Kiro function form."""
+    """Convert one replayed Client Tool Call to Kiro function form.
+
+    Args:
+        item: Validated Responses input item.
+        tool_type: External Client Tool type represented by the item.
+
+    Returns:
+        A generic Kiro function bridge retaining the original call ID.
+
+    Raises:
+        ResponsesConversionError: If the call shape or execution ownership
+            cannot be represented faithfully.
+    """
     if not item.call_id:
         raise ResponsesConversionError(
             f"{item.type} items require call_id"
         )
+    _validate_tool_execution(item, tool_type)
     name = _tool_call_name(item, tool_type)
     if tool_type == "custom":
         if not isinstance(item.input, str):
@@ -410,9 +498,7 @@ def _convert_tool_call(
                 f"custom_tool_call '{item.call_id}' input must be a raw string"
             )
         arguments = json.dumps({"input": item.input}, ensure_ascii=False)
-    elif tool_type == "shell":
-        arguments = _parse_tool_arguments(item.action, item.call_id, tool_type)
-    elif tool_type == "local_shell":
+    elif tool_type in {"shell", "local_shell"}:
         arguments = _parse_tool_arguments(item.action, item.call_id, tool_type)
     elif tool_type == "tool_search":
         arguments = _parse_tool_arguments(item.arguments, item.call_id, tool_type)
@@ -438,15 +524,59 @@ def _result_call_id(item: ResponsesInputItem, tool_type: str) -> Optional[str]:
     return None
 
 
+def _validate_tool_execution(item: ResponsesInputItem, tool_type: str) -> None:
+    """Reject replay fields that change Client Tool execution ownership.
+
+    Args:
+        item: Responses call or result item carrying the optional field.
+        tool_type: External Client Tool type represented by the item.
+
+    Raises:
+        ResponsesConversionError: If the item requests Hosted execution or
+            supplies execution for a tool type that does not support it.
+    """
+    if item.execution is None:
+        return
+    if tool_type == "tool_search" and item.execution == "client":
+        return
+    if tool_type == "tool_search" and item.execution == "server":
+        raise ResponsesConversionError(
+            "Hosted Tool 'tool_search' with execution=server is not supported"
+        )
+    if tool_type == "tool_search":
+        raise ResponsesConversionError(
+            "tool_search execution must be 'client' when provided"
+        )
+    raise ResponsesConversionError(
+        f"{item.type} does not support an execution field; "
+        "execution ownership is fixed for Client Tools"
+    )
+
+
 def _convert_tool_result(
     item: ResponsesInputItem,
     tool_type: str,
 ) -> Dict[str, Any]:
-    """Convert a replayed Responses Tool Result to unified form."""
+    """Convert a replayed Responses Tool Result to unified form.
+
+    Args:
+        item: Validated Responses Tool Result item.
+        tool_type: External Client Tool type represented by the item.
+
+    Returns:
+        A Kiro tool-result payload retaining the original call identity.
+
+    Raises:
+        ResponsesConversionError: If the call identity or execution
+            ownership is invalid.
+    """
     call_id = _result_call_id(item, tool_type)
     if not call_id:
         raise ResponsesConversionError(f"{item.type} items require call_id")
+    _validate_tool_execution(item, tool_type)
     output = item.output
+    if output is None:
+        output = item.tools if tool_type == "tool_search" else item.content
     if output is None:
         output = item.content
     if isinstance(output, (dict, list)):
@@ -551,7 +681,18 @@ def _convert_input_item(item: ResponsesInputItem) -> ResponsesInputItemIR:
 
 
 def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[ResponsesToolIR]:
-    """Convert supported Client Tools and reject Hosted Tools explicitly."""
+    """Convert supported Client Tools and reject Hosted Tools explicitly.
+
+    Args:
+        tools: Raw Responses tool definitions.
+
+    Returns:
+        Registered Client Tool records for the Kiro payload and output adapter.
+
+    Raises:
+        ResponsesConversionError: If a tool is Hosted, unknown, duplicated,
+            or otherwise cannot retain its Responses semantics.
+    """
     converted: List[ResponsesToolIR] = []
     for tool in tools or []:
         tool_type = tool.get("type")
