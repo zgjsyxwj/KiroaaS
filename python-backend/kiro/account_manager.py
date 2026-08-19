@@ -69,6 +69,10 @@ from kiro.model_catalog import (
     ModelSource,
     build_model_catalog,
 )
+from kiro.verified_models import (
+    VerifiedModelRecord,
+    get_current_verified_models,
+)
 
 
 def _get_model_records(models_data: object) -> Optional[List[Dict[str, Any]]]:
@@ -207,6 +211,7 @@ class Account:
         failures: Consecutive failure count (for Circuit Breaker)
         last_failure_time: Timestamp of last failure
         models_cached_at: Timestamp of last model cache update
+        verified_models: Account-scoped successful runtime model evidence
         stats: Usage statistics
     """
     id: str
@@ -216,6 +221,7 @@ class Account:
     failures: int = 0
     last_failure_time: float = 0.0
     models_cached_at: float = 0.0
+    verified_models: Dict[str, VerifiedModelRecord] = field(default_factory=dict)
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -413,6 +419,26 @@ class AccountManager:
                     account.failures = data.get("failures", 0)
                     account.last_failure_time = data.get("last_failure_time", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
+
+                    verified_model_data = data.get("verified_models", {})
+                    if not isinstance(verified_model_data, dict):
+                        verified_model_data = {}
+                    for model_id, record_data in verified_model_data.items():
+                        if not isinstance(model_id, str) or not isinstance(record_data, dict):
+                            continue
+                        kiro_model_id = record_data.get("kiro_model_id")
+                        verified_at = record_data.get("verified_at")
+                        if (
+                            kiro_model_id is not None
+                            and isinstance(kiro_model_id, str)
+                            and kiro_model_id.strip()
+                            and isinstance(verified_at, (int, float))
+                        ):
+                            account.verified_models[model_id] = VerifiedModelRecord(
+                                canonical_model_id=model_id,
+                                kiro_model_id=kiro_model_id,
+                                verified_at=float(verified_at),
+                            )
                     
                     stats_data = data.get("stats", {})
                     account.stats = AccountStats(
@@ -439,6 +465,13 @@ class AccountManager:
                     "failures": account.failures,
                     "last_failure_time": account.last_failure_time,
                     "models_cached_at": account.models_cached_at,
+                    "verified_models": {
+                        model_id: {
+                            "kiro_model_id": record.kiro_model_id,
+                            "verified_at": record.verified_at,
+                        }
+                        for model_id, record in account.verified_models.items()
+                    },
                     "stats": {
                         "total_requests": account.stats.total_requests,
                         "successful_requests": account.stats.successful_requests,
@@ -615,7 +648,8 @@ class AccountManager:
                 cache=model_cache,
                 hidden_models=HIDDEN_MODELS,
                 aliases=MODEL_ALIASES,
-                hidden_from_list=HIDDEN_FROM_LIST
+                hidden_from_list=HIDDEN_FROM_LIST,
+                verified_models=account.verified_models,
             )
             
             # Update account
@@ -762,17 +796,29 @@ class AccountManager:
                 return account
             
             # Multi-account logic: GLOBAL sticky
-            normalized_model = normalize_model_name(model)
+            evidence_account_ids = self._get_model_evidence_account_ids(model)
             
             # ALWAYS start from GLOBAL index (one current account for ALL models)
             start_index = self._current_account_index
             
             # ALWAYS iterate over ALL accounts
             all_account_ids = list(self._accounts.keys())
-            
-            for i in range(len(all_account_ids)):
-                current_index = (start_index + i) % len(all_account_ids)
-                account_id = all_account_ids[current_index]
+            ordered_account_ids = [
+                all_account_ids[(start_index + i) % len(all_account_ids)]
+                for i in range(len(all_account_ids))
+            ]
+            if evidence_account_ids is not None:
+                ordered_account_ids = [
+                    account_id
+                    for account_id in ordered_account_ids
+                    if account_id in evidence_account_ids
+                ] + [
+                    account_id
+                    for account_id in ordered_account_ids
+                    if account_id not in evidence_account_ids
+                ]
+
+            for account_id in ordered_account_ids:
                 account = self._accounts[account_id]
                 
                 # Skip accounts already tried in current failover loop
@@ -828,7 +874,7 @@ class AccountManager:
     
     async def report_success(self, account_id: str, model: str) -> None:
         """
-        Report successful request (reset failures, update stats, sticky, dynamic learning).
+        Report successful request and renew account-scoped model evidence.
         
         Args:
             account_id: Account ID
@@ -849,15 +895,38 @@ class AccountManager:
             account.stats.successful_requests += 1
             self._dirty = True
             
-            # Dynamic learning: add model to mapping if successful
-            # This allows system to learn about new models not in FALLBACK_MODELS
-            normalized_model = normalize_model_name(model)
-            if normalized_model not in self._model_to_accounts:
-                self._model_to_accounts[normalized_model] = ModelAccountList()
-                logger.debug(f"Dynamic learning: discovered new model '{normalized_model}'")
-            if account_id not in self._model_to_accounts[normalized_model].accounts:
-                self._model_to_accounts[normalized_model].accounts.append(account_id)
-                logger.debug(f"Dynamic learning: model '{normalized_model}' works on account {account_id}")
+            resolution = (
+                account.model_resolver.resolve(model)
+                if account.model_resolver is not None
+                else None
+            )
+            normalized_model = (
+                resolution.normalized
+                if resolution is not None
+                else normalize_model_name(model)
+            )
+            is_alias = (
+                account.model_resolver is not None
+                and model in account.model_resolver.aliases
+            )
+            has_verified_record = normalized_model in account.verified_models
+            if (
+                resolution is not None
+                and not is_alias
+                and normalized_model
+                and (
+                    resolution.source in {"passthrough", "verified"}
+                    or has_verified_record
+                )
+            ):
+                account.verified_models[normalized_model] = VerifiedModelRecord(
+                    canonical_model_id=normalized_model,
+                    kiro_model_id=resolution.internal_id,
+                    verified_at=time.time(),
+                )
+                logger.info(
+                    f"Verified model '{normalized_model}' for account {account_id}"
+                )
                 self._dirty = True
             
             # GLOBAL STICKY: Update global current_account_index
@@ -928,6 +997,53 @@ class AccountManager:
             # GLOBAL STICKY: Do NOT change _current_account_index on failure
             # It only changes on success (GLOBAL sticky behavior)
             # Failover happens through exclude_accounts in get_next_account()
+
+    def _get_model_evidence_account_ids(self, model: str) -> Optional[set[str]]:
+        """Return accounts preferred by current model evidence, if any.
+
+        A model with no current Verified Model evidence keeps the existing
+        optimistic account selection behavior. Once an account has current
+        runtime evidence, selection prefers accounts that can independently
+        explain the model through discovery, static configuration, or their
+        own Verified Model record.
+
+        Args:
+            model: External Model ID requested by the client.
+
+        Returns:
+            Preferred account IDs, or ``None`` when no Verified Model evidence
+            exists for the requested model. Other accounts remain available as
+            failover candidates and are not treated as verified.
+        """
+        resolved_model = MODEL_ALIASES.get(model, model)
+        for account in self._accounts.values():
+            if account.model_resolver is not None and model in account.model_resolver.aliases:
+                resolved_model = account.model_resolver.aliases[model]
+                break
+        normalized_model = normalize_model_name(resolved_model)
+        verified_account_ids: set[str] = set()
+
+        for account_id, account in self._accounts.items():
+            current_records = get_current_verified_models(
+                account.verified_models,
+                ACCOUNT_CACHE_TTL,
+            )
+            if normalized_model in {
+                record.canonical_model_id for record in current_records
+            }:
+                verified_account_ids.add(account_id)
+
+        if not verified_account_ids:
+            return None
+
+        eligible_account_ids = set(verified_account_ids)
+        for account_id, account in self._accounts.items():
+            if account.model_resolver is None:
+                continue
+            resolution = account.model_resolver.resolve(model)
+            if resolution.source in {"cache", "hidden"}:
+                eligible_account_ids.add(account_id)
+        return eligible_account_ids
     
     def get_first_account(self) -> Account:
         """
@@ -971,9 +1087,13 @@ class AccountManager:
             Canonical, deduplicated model catalog entries.
         """
         discovered_models: List[Dict[str, Any]] = []
+        verified_models: List[VerifiedModelRecord] = []
         discovery_available = False
 
         for account in self._accounts.values():
+            verified_models.extend(
+                get_current_verified_models(account.verified_models, ACCOUNT_CACHE_TTL)
+            )
             if not account.model_cache or account.model_cache.source != MODEL_SOURCE_DYNAMIC:
                 continue
             if account.model_cache.is_stale():
@@ -999,4 +1119,5 @@ class AccountManager:
             aliases=MODEL_ALIASES,
             hidden_models=HIDDEN_MODELS,
             hidden_from_list=HIDDEN_FROM_LIST,
+            verified_models=verified_models,
         )

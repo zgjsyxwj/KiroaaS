@@ -361,9 +361,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 )
                 
                 if response.status_code == 200:
-                    # SUCCESS - report and return
-                    await account_manager.report_success(account.id, request_data.model)
-                    
                     # Prepare data for token counting
                     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
                     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
@@ -390,6 +387,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     request_tools=tools_for_tokenizer
                                 ):
                                     yield chunk
+                                await account_manager.report_success(account.id, request_data.model)
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -429,6 +427,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer
                         )
+
+                        await account_manager.report_success(account.id, request_data.model)
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
@@ -557,7 +557,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
+        account_manager = request.app.state.account_manager
+        account = account_manager.get_first_account()
         if not account.auth_manager:
             logger.error("No initialized accounts available (legacy mode)")
             raise HTTPException(503, "No initialized accounts available")
@@ -691,6 +692,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         request_tools=tools_for_tokenizer
                     ):
                         yield chunk
+                    await account_manager.report_success(account.id, request_data.model)
                 except GeneratorExit:
                     # Client disconnected - this is normal
                     client_disconnected = True
@@ -736,6 +738,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer
             )
+
+            await account_manager.report_success(account.id, request_data.model)
             
             await http_client.close()
             

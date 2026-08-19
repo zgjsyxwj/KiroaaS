@@ -439,9 +439,6 @@ async def messages(
                 )
                 
                 if response.status_code == 200:
-                    # SUCCESS - report and return
-                    await account_manager.report_success(account.id, request_data.model)
-                    
                     if request_data.stream:
                         # Streaming mode
                         async def stream_wrapper():
@@ -464,6 +461,7 @@ async def messages(
                                     request_system=system_for_tokenizer,
                                 ):
                                     yield chunk
+                                await account_manager.report_success(account.id, request_data.model)
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -511,6 +509,8 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                         )
+
+                        await account_manager.report_success(account.id, request_data.model)
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -664,7 +664,8 @@ async def messages(
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
+        account_manager = request.app.state.account_manager
+        account = account_manager.get_first_account()
         if not account.auth_manager:
             logger.error("No initialized accounts available (legacy mode)")
             return JSONResponse(
@@ -827,6 +828,7 @@ async def messages(
                         request_system=system_for_tokenizer,
                     ):
                         yield chunk
+                    await account_manager.report_success(account.id, request_data.model)
                 except GeneratorExit:
                     client_disconnected = True
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -875,6 +877,8 @@ async def messages(
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
             )
+
+            await account_manager.report_success(account.id, request_data.model)
             
             await http_client.close()
             

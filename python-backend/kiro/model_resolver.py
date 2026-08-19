@@ -20,11 +20,12 @@
 """
 Dynamic Model Resolution System for Kiro Gateway.
 
-Implements a 4-layer resolution pipeline:
+Implements a 5-layer resolution pipeline:
 1. Normalize Name - Convert client formats to Kiro format (dashes→dots, strip dates)
 2. Check Dynamic Cache - Models from /ListAvailableModels API
 3. Check Hidden Models - Manual config for undocumented models
-4. Pass-through - Unknown models sent to Kiro (let Kiro decide)
+4. Check Verified Models - Account-scoped successful runtime evidence
+5. Pass-through - Unknown models sent to Kiro (let Kiro decide)
 
 Key Principle: We are a gateway, not a gatekeeper. Kiro API is the final arbiter.
 """
@@ -33,7 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, List, Mapping, MutableMapping, Optional
 
 from loguru import logger
 
@@ -43,7 +44,11 @@ if TYPE_CHECKING:
 
 # Valid model IDs accepted by runtime.{region}.kiro.dev
 # Generated from FALLBACK_MODELS to maintain single source of truth
-from kiro.config import FALLBACK_MODELS
+from kiro.config import ACCOUNT_CACHE_TTL, FALLBACK_MODELS
+from kiro.verified_models import (
+    VerifiedModelRecord,
+    get_current_verified_models,
+)
 
 VALID_RUNTIME_MODEL_IDS: set = {model["modelId"] for model in FALLBACK_MODELS}
 
@@ -72,10 +77,12 @@ class ModelResolution:
     
     Attributes:
         internal_id: ID to send to Kiro API
-        source: Resolution source - "cache", "hidden", or "passthrough"
+        source: Resolution source - "cache", "hidden", "verified", or
+                "passthrough"
         original_request: What client originally sent
         normalized: Model name after normalization
-        is_verified: True if found in cache/hidden, False if passthrough
+        is_verified: True if found in cache/hidden/verified evidence, False if
+                     passthrough
     """
     internal_id: str
     source: str
@@ -263,7 +270,8 @@ class ModelResolver:
     1. Normalize name (dashes→dots, strip dates)
     2. Check dynamic cache (from /ListAvailableModels)
     3. Check hidden models (manual config)
-    4. Pass-through (let Kiro decide)
+    4. Account-scoped Verified Model evidence
+    5. Pass-through (let Kiro decide)
     
     Attributes:
         cache: ModelInfoCache instance for dynamic model lookup
@@ -285,7 +293,9 @@ class ModelResolver:
         cache: ModelInfoCache,
         hidden_models: Optional[Dict[str, str]] = None,
         aliases: Optional[Dict[str, str]] = None,
-        hidden_from_list: Optional[List[str]] = None
+        hidden_from_list: Optional[List[str]] = None,
+        verified_models: Optional[MutableMapping[str, VerifiedModelRecord]] = None,
+        verified_model_ttl: float = ACCOUNT_CACHE_TTL,
     ):
         """
         Initialize the model resolver.
@@ -298,11 +308,27 @@ class ModelResolver:
                     Example: {"auto-kiro": "auto", "my-opus": "claude-opus-4.5"}
             hidden_from_list: List of model IDs to hide from /v1/models endpoint.
                              These models still work but are not shown in the list.
+            verified_models: Mutable account-owned runtime verification records.
+            verified_model_ttl: TTL for account-owned verification evidence.
         """
         self.cache = cache
         self.hidden_models = hidden_models or {}
         self.aliases = aliases or {}
         self.hidden_from_list = set(hidden_from_list or [])
+        self.verified_models = verified_models if verified_models is not None else {}
+        self.verified_model_ttl = verified_model_ttl
+
+    def _get_current_verified_model(self, normalized_model: str) -> Optional[VerifiedModelRecord]:
+        """Return current account-owned evidence for a normalized model ID.
+
+        Args:
+            normalized_model: Canonical model ID to look up.
+
+        Returns:
+            Current verification evidence, or ``None`` when absent/expired.
+        """
+        get_current_verified_models(self.verified_models, self.verified_model_ttl)
+        return self.verified_models.get(normalized_model)
     
     def resolve(self, external_model: str) -> ModelResolution:
         """
@@ -368,6 +394,20 @@ class ModelResolver:
                 is_verified=True
             )
 
+        # Layer 3.5: Check account-scoped runtime verification evidence.
+        verified_model = self._get_current_verified_model(normalized)
+        if verified_model is not None:
+            logger.debug(
+                f"Model '{normalized}' found in account verification evidence"
+            )
+            return ModelResolution(
+                internal_id=verified_model.kiro_model_id,
+                source="verified",
+                original_request=external_model,
+                normalized=normalized,
+                is_verified=True,
+            )
+
         # Layer 4: Pass-through - validate for runtime endpoint
         runtime_id = to_runtime_model_id(normalized)
         logger.info(
@@ -402,6 +442,15 @@ class ModelResolver:
         
         # Add hidden model display names (they use dot format)
         models.update(self.hidden_models.keys())
+
+        # Add only current canonical IDs from account-owned evidence.
+        models.update(
+            record.canonical_model_id
+            for record in get_current_verified_models(
+                self.verified_models,
+                self.verified_model_ttl,
+            )
+        )
         
         # Remove models that should be hidden from list
         models -= self.hidden_from_list

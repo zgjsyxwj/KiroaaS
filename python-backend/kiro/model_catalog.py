@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Collection, Dict, Iterable, List, Literal, Mapping, Optional, Set
 
 from kiro.model_resolver import normalize_model_name
+from kiro.verified_models import VerifiedModelRecord
 
 
 ModelSource = Literal["dynamic", "fallback"]
@@ -54,6 +55,7 @@ def build_model_catalog(
     aliases: Mapping[str, str],
     hidden_models: Mapping[str, str],
     hidden_from_list: Collection[str],
+    verified_models: Iterable[VerifiedModelRecord] = (),
 ) -> List[ModelCatalogEntry]:
     """Build a unique, stable catalog from one authoritative model source.
 
@@ -68,6 +70,8 @@ def build_model_catalog(
         aliases: Accepted input aliases that must remain hidden.
         hidden_models: Static external-to-Kiro mappings used by fallback mode.
         hidden_from_list: Canonical IDs intentionally excluded from discovery.
+        verified_models: Current account-scoped runtime evidence to merge into
+                         the catalog without changing the curated fallback.
 
     Returns:
         Canonical entries ordered with GPT 5.6 models first and all remaining
@@ -84,6 +88,8 @@ def build_model_catalog(
             }
             for external_model_id, kiro_model_id in hidden_models.items()
         )
+
+    source_models.extend(record.as_model_record() for record in verified_models)
 
     alias_names = {
         alias.strip()
