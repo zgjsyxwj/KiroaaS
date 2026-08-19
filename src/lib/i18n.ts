@@ -161,6 +161,7 @@ export const translations = {
     chatPlaceholder: '输入消息...',
     chatServerOffline: '服务器离线',
     chatServerOfflineDesc: '请先启动服务器',
+    chatModelSelection: '选择模型',
     chatError: '发送消息失败',
 
     // Conversations
@@ -286,6 +287,8 @@ export const translations = {
     modelsServerOffline: '启动服务器后查看模型列表',
     modelsLoadFailed: '加载模型列表失败',
     modelsEmpty: '暂无可用模型',
+    modelsLoading: '正在加载模型列表...',
+    modelsRefresh: '刷新模型列表',
     modelsClickToView: '点击查看',
 
     // Account
@@ -525,6 +528,7 @@ export const translations = {
     chatPlaceholder: 'Type a message...',
     chatServerOffline: 'Server offline',
     chatServerOfflineDesc: 'Please start the server first',
+    chatModelSelection: 'Select a model',
     chatError: 'Failed to send message',
 
     // Conversations
@@ -650,6 +654,8 @@ export const translations = {
     modelsServerOffline: 'Start the server to view models',
     modelsLoadFailed: 'Failed to load models',
     modelsEmpty: 'No models available',
+    modelsLoading: 'Loading models...',
+    modelsRefresh: 'Refresh model list',
     modelsClickToView: 'Click to view',
     cloudPageDesc: 'Bypass restrictions, get your Claude back',
     cloudEnableTitle: 'Enable KiroaaS Cloud',
@@ -842,6 +848,7 @@ export const translations = {
     chatPlaceholder: 'Введите сообщение...',
     chatServerOffline: 'Сервер офлайн',
     chatServerOfflineDesc: 'Сначала запустите сервер',
+    chatModelSelection: 'Выберите модель',
     chatError: 'Не удалось отправить сообщение',
 
     // Conversations
@@ -968,6 +975,8 @@ export const translations = {
     modelsServerOffline: 'Запустите сервер для просмотра моделей',
     modelsLoadFailed: 'Не удалось загрузить модели',
     modelsEmpty: 'Нет доступных моделей',
+    modelsLoading: 'Загрузка моделей...',
+    modelsRefresh: 'Обновить список моделей',
     modelsClickToView: 'Нажмите, чтобы посмотреть',
 
     // Account
@@ -1185,6 +1194,7 @@ export const translations = {
     chatPlaceholder: 'Escribe un mensaje...',
     chatServerOffline: 'Servidor desconectado',
     chatServerOfflineDesc: 'Por favor, inicia el servidor primero',
+    chatModelSelection: 'Seleccionar un modelo',
     chatError: 'Error al enviar mensaje',
 
     // Conversations
@@ -1311,6 +1321,8 @@ export const translations = {
     modelsServerOffline: 'Inicia el servidor para ver los modelos',
     modelsLoadFailed: 'Error al cargar los modelos',
     modelsEmpty: 'No hay modelos disponibles',
+    modelsLoading: 'Cargando modelos...',
+    modelsRefresh: 'Actualizar lista de modelos',
     modelsClickToView: 'Haz clic para ver',
 
     // Account
@@ -1528,6 +1540,7 @@ export const translations = {
     chatPlaceholder: 'Ketik pesan...',
     chatServerOffline: 'Server offline',
     chatServerOfflineDesc: 'Silakan mulai server terlebih dahulu',
+    chatModelSelection: 'Pilih model',
     chatError: 'Gagal mengirim pesan',
 
     // Conversations
@@ -1654,6 +1667,8 @@ export const translations = {
     modelsServerOffline: 'Mulai server untuk melihat model',
     modelsLoadFailed: 'Gagal memuat model',
     modelsEmpty: 'Tidak ada model tersedia',
+    modelsLoading: 'Memuat model...',
+    modelsRefresh: 'Segarkan daftar model',
     modelsClickToView: 'Klik untuk melihat',
 
     // Account
@@ -1871,6 +1886,7 @@ export const translations = {
     chatPlaceholder: 'Digite uma mensagem...',
     chatServerOffline: 'Servidor offline',
     chatServerOfflineDesc: 'Por favor, inicie o servidor primeiro',
+    chatModelSelection: 'Selecionar um modelo',
     chatError: 'Falha ao enviar mensagem',
 
     // Conversations
@@ -1997,6 +2013,8 @@ export const translations = {
     modelsServerOffline: 'Inicie o servidor para ver os modelos',
     modelsLoadFailed: 'Falha ao carregar modelos',
     modelsEmpty: 'Nenhum modelo disponível',
+    modelsLoading: 'Carregando modelos...',
+    modelsRefresh: 'Atualizar lista de modelos',
     modelsClickToView: 'Clique para ver',
 
     // Account
@@ -2214,6 +2232,7 @@ export const translations = {
     chatPlaceholder: 'メッセージを入力...',
     chatServerOffline: 'サーバーオフライン',
     chatServerOfflineDesc: '先にサーバーを起動してください',
+    chatModelSelection: 'モデルを選択',
     chatError: 'メッセージの送信に失敗しました',
 
     // Conversations
@@ -2340,6 +2359,8 @@ export const translations = {
     modelsServerOffline: 'サーバーを起動してモデルを表示',
     modelsLoadFailed: 'モデルの読み込みに失敗',
     modelsEmpty: '利用可能なモデルがありません',
+    modelsLoading: 'モデルを読み込み中...',
+    modelsRefresh: 'モデル一覧を更新',
     modelsClickToView: 'クリックして表示',
 
     // Account
@@ -2557,6 +2578,7 @@ export const translations = {
     chatPlaceholder: '메시지 입력...',
     chatServerOffline: '서버 오프라인',
     chatServerOfflineDesc: '먼저 서버를 시작하세요',
+    chatModelSelection: '모델 선택',
     chatError: '메시지 전송 실패',
 
     // Conversations
@@ -2683,6 +2705,8 @@ export const translations = {
     modelsServerOffline: '서버를 시작하여 모델 확인',
     modelsLoadFailed: '모델 로드 실패',
     modelsEmpty: '사용 가능한 모델이 없습니다',
+    modelsLoading: '모델 로드 중...',
+    modelsRefresh: '모델 목록 새로 고침',
     modelsClickToView: '클릭하여 보기',
 
     // Account
@@ -2900,6 +2924,7 @@ export const translations = {
     chatPlaceholder: 'Nhập tin nhắn...',
     chatServerOffline: 'Máy chủ ngoại tuyến',
     chatServerOfflineDesc: 'Vui lòng khởi động máy chủ trước',
+    chatModelSelection: 'Chọn mô hình',
     chatError: 'Không thể gửi tin nhắn',
 
     // Conversations
@@ -3026,6 +3051,8 @@ export const translations = {
     modelsServerOffline: 'Khởi động máy chủ để xem mô hình',
     modelsLoadFailed: 'Không thể tải mô hình',
     modelsEmpty: 'Không có mô hình khả dụng',
+    modelsLoading: 'Đang tải mô hình...',
+    modelsRefresh: 'Làm mới danh sách mô hình',
     modelsClickToView: 'Nhấp để xem',
 
     // Account

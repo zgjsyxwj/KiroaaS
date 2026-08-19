@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Send, Loader2, Trash2, ImagePlus, X, Sparkles, Copy, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -15,6 +15,10 @@ import {
 import { useI18n } from '@/hooks/useI18n';
 import { ConversationSidebar } from './ConversationSidebar';
 import type { Conversation } from '@/lib/conversations';
+import {
+  MODEL_CATALOG_STATUS_KEYS,
+  type ModelCatalogState,
+} from '@/lib/modelCatalog';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -59,6 +63,8 @@ interface ChatViewProps {
   onNewChat: () => void;
   onDeleteConversation: (id: string) => void;
   onRenameConversation: (id: string, title: string) => void;
+  modelCatalog: ModelCatalogState;
+  onRefreshModelCatalog: () => Promise<void>;
 }
 
 export function ChatView({
@@ -74,6 +80,8 @@ export function ChatView({
   onNewChat,
   onDeleteConversation,
   onRenameConversation,
+  modelCatalog,
+  onRefreshModelCatalog,
 }: ChatViewProps) {
   // 0.0.0.0 is for server binding (listen on all interfaces), not a valid client address
   const fetchHost = host === '0.0.0.0' ? '127.0.0.1' : host;
@@ -81,7 +89,7 @@ export function ChatView({
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [model, setModel] = useState('claude-sonnet-4-6');
+  const [model, setModel] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -133,7 +141,7 @@ export function ChatView({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!input.trim() && images.length === 0) || isLoading || !isRunning) return;
+    if ((!input.trim() && images.length === 0) || isLoading || !isRunning || !model) return;
 
     // Build message content
     let userContent: string | MessageContent[];
@@ -266,43 +274,18 @@ export function ChatView({
       .filter(Boolean);
   };
 
-  const models = [
-    'claude-opus-4-6',
-    'claude-sonnet-4-6',
-    'claude-opus-4-5',
-    'claude-haiku-4-5',
-  ];
-
-  const [availableModels, setAvailableModels] = useState<string[]>(models);
-
-  // Fetch models from API
-  const fetchModels = useCallback(async () => {
-    if (!isRunning) return;
-    try {
-      const response = await fetch(`http://${fetchHost}:${port}/v1/models`, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-        },
-      });
-      if (response.ok) {
-        const data = await response.json();
-        const modelIds = data.data?.map((m: { id: string }) => m.id).filter((id: string) => id && !id.includes('auto-kiro'));
-        if (modelIds && modelIds.length > 0) {
-          setAvailableModels(modelIds);
-          // If current model is not in the list, select the first one
-          if (!modelIds.includes(model)) {
-            setModel(modelIds[0]);
-          }
-        }
-      }
-    } catch {
-      // Fall back to default models
-    }
-  }, [host, port, apiKey, isRunning, model]);
+  const { models, status } = modelCatalog;
+  const modelCatalogMessage = status === 'ready' ? null : t(MODEL_CATALOG_STATUS_KEYS[status]);
+  const canChat = isRunning && status === 'ready' && model.length > 0;
 
   useEffect(() => {
-    fetchModels();
-  }, [fetchModels]);
+    setModel((currentModel) => {
+      if (models.some((availableModel) => availableModel.id === currentModel)) {
+        return currentModel;
+      }
+      return models[0]?.id ?? '';
+    });
+  }, [models]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -515,19 +498,40 @@ export function ChatView({
               />
               {/* Top row: model selector */}
               <div className="px-1">
-                <Select value={model} onValueChange={setModel} disabled={!isRunning}>
-                  <SelectTrigger className="w-auto h-7 bg-stone-100 border-none text-stone-500 hover:bg-stone-200 rounded-full px-3 text-xs font-medium focus:ring-0 gap-1">
-                    <Sparkles className="h-3 w-3" />
-                    <SelectValue />
+                <Select
+                  value={model}
+                  onValueChange={setModel}
+                  disabled={!isRunning || status !== 'ready' || isLoading}
+                >
+                  <SelectTrigger
+                    aria-label={t('chatModelSelection')}
+                    className="w-auto h-7 bg-stone-100 border-none text-stone-500 hover:bg-stone-200 rounded-full px-3 text-xs font-medium focus:ring-0 gap-1"
+                  >
+                    <Sparkles className="h-3 w-3" aria-hidden="true" />
+                    <SelectValue placeholder={modelCatalogMessage ?? t('chatModelSelection')} />
                   </SelectTrigger>
                   <SelectContent className="rounded-xl" side="top">
-                    {availableModels.map((m) => (
-                      <SelectItem key={m} value={m} className="text-xs">
-                        {m}
+                    {models.map((availableModel) => (
+                      <SelectItem key={availableModel.id} value={availableModel.id} className="text-xs">
+                        {availableModel.id}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {status !== 'ready' && (
+                  <div className="mt-1 flex items-center gap-2 text-[10px] text-stone-400" role="status" aria-live="polite">
+                    <span>{modelCatalogMessage}</span>
+                    {isRunning && status !== 'loading' && (
+                      <button
+                        type="button"
+                        onClick={() => void onRefreshModelCatalog()}
+                        className="font-semibold text-stone-500 underline underline-offset-2 hover:text-stone-700"
+                      >
+                        {t('modelsRefresh')}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
               {/* Bottom row: textarea and buttons */}
               <div className="flex items-end gap-2">
@@ -538,8 +542,8 @@ export function ChatView({
                   onKeyDown={handleKeyDown}
                   onCompositionStart={() => { composingRef.current = true; }}
                   onCompositionEnd={() => { composingRef.current = false; compositionEndTimeRef.current = Date.now(); }}
-                  placeholder={isRunning ? t('chatPlaceholder') : t('chatServerOffline')}
-                  disabled={!isRunning || isLoading}
+                  placeholder={canChat ? t('chatPlaceholder') : (modelCatalogMessage ?? t('chatServerOffline'))}
+                  disabled={!canChat || isLoading}
                   rows={1}
                   className="flex-1 resize-none bg-transparent border-0 px-2 py-1 text-sm focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed placeholder:text-stone-400"
                   style={{ minHeight: '36px', maxHeight: '150px' }}
@@ -548,14 +552,14 @@ export function ChatView({
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={!isRunning || isLoading}
+                    disabled={!canChat || isLoading}
                     className="h-9 w-9 rounded-full flex items-center justify-center text-stone-400 hover:text-stone-600 hover:bg-stone-100 transition-colors disabled:opacity-30"
                   >
                     <ImagePlus className="h-5 w-5" />
                   </button>
                   <Button
                     type="submit"
-                    disabled={(!input.trim() && images.length === 0) || isLoading || !isRunning}
+                    disabled={(!input.trim() && images.length === 0) || isLoading || !canChat}
                     className="h-9 w-9 rounded-full bg-stone-800 hover:bg-stone-700 disabled:opacity-30"
                   >
                     {isLoading ? (

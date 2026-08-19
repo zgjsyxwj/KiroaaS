@@ -13,6 +13,7 @@ import { useConfig } from './hooks/useConfig';
 import type { AppConfig } from './lib/config';
 import { useI18n } from './hooks/useI18n';
 import { useServerStatus } from './hooks/useServerStatus';
+import { useModelCatalog } from './lib/modelCatalog';
 import { useConversations } from './hooks/useConversations';
 import { startServer, stopServer, getServerLogs, getAppVersion, getDeviceModel, updateTrayServerState, getPortOccupier, terminateProcess, cloudGetSession } from './lib/tauri';
 import { checkVersionUpdate } from './lib/versionCheck';
@@ -75,6 +76,12 @@ export default function App() {
   const isStarting = pendingAction === 'start' || status.status === 'starting';
   const isStopping = pendingAction === 'stop';
   const isProcessing = isStarting || isStopping;
+  const modelCatalog = useModelCatalog(
+    config.server_host,
+    config.server_port,
+    config.proxy_api_key,
+    isRunning,
+  );
 
   // Detect platform
   useEffect(() => {
@@ -738,10 +745,9 @@ export default function App() {
 
                     {/* Supported Models */}
                     <ModelsCard
-                      host={config.server_host}
-                      port={config.server_port}
-                      apiKey={config.proxy_api_key}
+                      catalog={modelCatalog}
                       isRunning={isRunning}
+                      onRefresh={modelCatalog.refresh}
                     />
                   </div>
 
@@ -834,6 +840,8 @@ export default function App() {
                   onNewChat={startNewChat}
                   onDeleteConversation={deleteConversation}
                   onRenameConversation={renameConversation}
+                  modelCatalog={modelCatalog}
+                  onRefreshModelCatalog={modelCatalog.refresh}
                 />
               </div>
             )}
