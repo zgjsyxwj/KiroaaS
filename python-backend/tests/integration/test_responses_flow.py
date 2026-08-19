@@ -258,3 +258,164 @@ def test_responses_does_not_echo_non_json_upstream_error(
 
     assert response.status_code == 400
     assert "secret prompt" not in response.text
+
+
+def test_responses_high_level_seam_preserves_history_images_and_safe_controls(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """The HTTP seam preserves stateless history and passes base64 images to Kiro."""
+    from main import app
+
+    transport = KiroResponsesTransport()
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "second"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "third"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AAAA",
+                        },
+                    ],
+                },
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "metadata": {"trace_id": "trace-1"},
+            "prompt_cache_key": "cache-1",
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+            "store": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["store"] is False
+    payload = transport.payload
+    assert payload is not None
+    history = payload["conversationState"]["history"]
+    assert history[0]["userInputMessage"]["content"].endswith("first")
+    assert history[1]["assistantResponseMessage"]["content"] == "second"
+    current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+    assert current["content"].endswith("third")
+    assert current["images"] == [{"format": "png", "source": {"bytes": "AAAA"}}]
+
+
+def test_responses_high_level_seam_rejects_stateful_and_contract_changing_fields(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+):
+    """Unsupported ownership and output guarantees fail at the HTTP boundary."""
+    cases = [
+        ({"previous_response_id": "resp_old"}, "previous_response_id"),
+        ({"conversation": "conv_old"}, "conversation"),
+        ({"background": True}, "background"),
+        ({"store": True}, "storage"),
+        ({"service_tier": "default"}, "service_tier"),
+        ({"text": {"format": {"type": "json_schema"}}}, "Structured output"),
+        ({"tool_choice": "required"}, "tool choice"),
+    ]
+
+    for extra, expected_text in cases:
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"model": "model", "input": "hello", **extra},
+        )
+        assert response.status_code == 400
+        assert expected_text.lower() in response.json()["detail"].lower()
+
+
+def test_responses_high_level_seam_rejects_remote_and_file_media_before_upstream(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+):
+    """Remote URLs and file references never reach the Kiro transport."""
+    cases = [
+        {"type": "input_image", "image_url": "https://example.test/image.png"},
+        {"type": "input_image", "file_id": "file_123"},
+        {"type": "input_file", "file_url": "file:///tmp/input.txt"},
+    ]
+
+    for block in cases:
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "model",
+                "input": [
+                    {"type": "message", "role": "user", "content": [block]}
+                ],
+            },
+        )
+        assert response.status_code == 400
+        assert any(word in response.json()["detail"].lower() for word in ("url", "file", "base64"))
+
+
+def test_responses_high_level_seam_reports_actionable_context_limit_error(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A Kiro context rejection tells the client to reduce its own request."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        status_code=400,
+        error_body=b'{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}',
+    )
+
+    def make_stub_client(**kwargs):
+        """Build the request-scoped client against the isolated error transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    import kiro.http_client
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello"},
+    )
+
+    assert response.status_code == 400
+    message = response.json()["error"]["message"].lower()
+    assert "context limit" in message
+    assert "reduce" in message
+
+
+def test_responses_high_level_seam_returns_validation_error_for_malformed_input(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+):
+    """Malformed JSON shapes fail validation without invoking Kiro."""
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": {"role": "user", "content": "hello"}},
+    )
+
+    assert response.status_code == 422

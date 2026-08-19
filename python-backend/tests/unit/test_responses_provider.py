@@ -7,11 +7,16 @@ from types import SimpleNamespace
 import pytest
 
 from kiro.converters_responses import (
+    THINKING_BUDGETS,
     ResponsesConversionError,
     convert_responses_request,
 )
 from kiro.models_responses import ResponsesRequest
-from kiro.responses_provider import build_responses_object, estimate_responses_usage
+from kiro.responses_provider import (
+    build_responses_kiro_payload,
+    build_responses_object,
+    estimate_responses_usage,
+)
 from kiro.streaming_core import StreamResult
 
 
@@ -106,6 +111,120 @@ def test_responses_ignores_encrypted_and_empty_reasoning_items():
     assert request_ir.messages[0].content == "continue"
 
 
+def test_responses_keeps_readable_reasoning_content_without_summary():
+    """Readable reasoning content is not mistaken for an encrypted field."""
+    request_ir = convert_responses_request(
+        ResponsesRequest(
+            model="model",
+            input=[
+                {"type": "reasoning", "content": "Readable context"},
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+        )
+    )
+
+    assert request_ir.messages[0].content == "Readable context"
+
+
+@pytest.mark.parametrize("effort, expected_budget", [("none", None), *THINKING_BUDGETS.items()])
+def test_responses_maps_thinking_budget_without_global_cap(effort, expected_budget):
+    """Responses effort values retain their documented Kiro budget exactly."""
+    request_ir = convert_responses_request(
+        ResponsesRequest(
+            model="model",
+            input="hello",
+            reasoning={"effort": effort},
+        )
+    )
+
+    assert request_ir.thinking_config.enabled is (effort != "none")
+    assert request_ir.thinking_config.budget_tokens == expected_budget
+    assert request_ir.thinking_config.enforce_budget_cap is False
+    assert request_ir.thinking_config.include_system_guidance is (effort != "none")
+
+
+def test_responses_none_disables_thinking_tags_and_system_guidance():
+    """The explicit none setting disables the gateway thinking behavior."""
+    request = ResponsesRequest(
+        model="model",
+        input="hello",
+        reasoning={"effort": "none"},
+    )
+    request_ir = convert_responses_request(request)
+    payload = build_responses_kiro_payload(
+        request_ir,
+        profile_arn="",
+        kiro_model_id="model",
+    ).payload
+    content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+    assert "<thinking_mode>" not in content
+    assert "Extended Thinking Mode" not in content
+
+
+def test_responses_accepts_safe_metadata_include_cache_key_and_verbosity():
+    """Safe response controls are accepted and verbosity is best-effort steering."""
+    request_ir = convert_responses_request(
+        ResponsesRequest(
+            model="model",
+            input="hello",
+            include=["reasoning.encrypted_content"],
+            metadata={"trace_id": "trace-1"},
+            prompt_cache_key="cache-1",
+            text={"format": {"type": "text"}, "verbosity": "low"},
+            store=False,
+        )
+    )
+
+    assert "Response verbosity preference: low" in request_ir.system_prompt
+
+
+def test_responses_rejects_invalid_verbosity_and_prompt_cache_retention():
+    """Unsupported best-effort controls fail instead of being silently ignored."""
+    with pytest.raises(ResponsesConversionError, match="verbosity"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                text={"verbosity": "extreme"},
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="reasoning effort"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                reasoning={"effort": []},
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="strict"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "run",
+                        "parameters": {"type": "object"},
+                        "strict": True,
+                    }
+                ],
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="prompt_cache_retention"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input="hello",
+                prompt_cache_retention="24h",
+            )
+        )
+
+
 def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
     """Protocol items and controls are rejected instead of losing semantics."""
     with pytest.raises(ResponsesConversionError, match="no preceding function_call"):
@@ -147,6 +266,53 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
                             }
                         ],
                     }
+                ],
+            )
+        )
+
+    with pytest.raises(ResponsesConversionError, match="file ID"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_image", "file_id": "file_123"}],
+                    }
+                ],
+            )
+        )
+
+
+def test_responses_payload_limit_fails_without_trimming(monkeypatch):
+    """Oversized stateless requests return a shrinkable error before Kiro."""
+    monkeypatch.setattr("kiro.responses_provider.KIRO_MAX_PAYLOAD_BYTES", 100)
+    request = ResponsesRequest(model="model", input="x" * 200)
+    request_ir = convert_responses_request(request)
+
+    with pytest.raises(ResponsesConversionError, match="Reduce"):
+        build_responses_kiro_payload(request_ir, profile_arn="", kiro_model_id="model")
+
+
+def test_responses_rejects_malformed_replayed_function_arguments():
+    """Malformed replayed tool arguments fail before Kiro JSON conversion."""
+    with pytest.raises(ResponsesConversionError, match="valid JSON"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "run",
+                        "arguments": "{not-json",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "done",
+                    },
                 ],
             )
         )

@@ -36,6 +36,8 @@ _HOSTED_TOOL_TYPES = {
     "web_search_preview",
 }
 
+_VERBOSITY_VALUES = {"low", "medium", "high"}
+
 
 class ResponsesConversionError(ValueError):
     """Raised when a Responses capability cannot be represented faithfully."""
@@ -112,7 +114,12 @@ def _extract_instruction_text(value: Any, field_name: str) -> str:
                     f"{field_name} must contain text blocks"
                 )
             block_type = block.get("type", "input_text")
-            if block_type not in {"input_text", "text", "output_text", "summary_text"}:
+            if not isinstance(block_type, str) or block_type not in {
+                "input_text",
+                "text",
+                "output_text",
+                "summary_text",
+            }:
                 raise ResponsesConversionError(
                     f"Unsupported {field_name} content type: {block_type}"
                 )
@@ -148,6 +155,10 @@ def _normalize_content(content: Any, field_name: str) -> Tuple[str, List[Dict[st
             raise ResponsesConversionError(f"{field_name} contains an invalid block")
 
         block_type = block.get("type")
+        if not isinstance(block_type, str):
+            raise ResponsesConversionError(
+                f"Unsupported {field_name} content type: {block_type or 'missing type'}"
+            )
         if block_type in {"input_text", "output_text", "text"}:
             text = block.get("text")
             if not isinstance(text, str):
@@ -161,6 +172,11 @@ def _normalize_content(content: Any, field_name: str) -> Tuple[str, List[Dict[st
             image_block = _normalize_image_block(block, field_name)
             normalized_blocks.append(image_block)
             continue
+
+        if block_type in {"input_file", "file", "file_id", "file_url"}:
+            raise ResponsesConversionError(
+                f"{field_name} file references are not supported; send an inline base64 image data URL"
+            )
 
         raise ResponsesConversionError(
             f"Unsupported {field_name} content type: {block_type or 'missing type'}"
@@ -179,7 +195,12 @@ def _normalize_image_block(block: Dict[str, Any], field_name: str) -> Dict[str, 
         if isinstance(source, dict) and source.get("type") == "base64":
             media_type = source.get("media_type")
             data = source.get("data")
-            if isinstance(media_type, str) and isinstance(data, str) and data:
+            if (
+                isinstance(media_type, str)
+                and media_type.startswith("image/")
+                and isinstance(data, str)
+                and data
+            ):
                 return {
                     "type": "image",
                     "source": {
@@ -188,18 +209,52 @@ def _normalize_image_block(block: Dict[str, Any], field_name: str) -> Dict[str, 
                         "data": data,
                     },
                 }
+        if isinstance(source, dict) and source.get("type") in {"url", "file", "file_id"}:
+            raise ResponsesConversionError(
+                f"{field_name} remote URLs and file references are not supported for images"
+            )
         raise ResponsesConversionError(
             f"{field_name} only supports base64 image sources"
         )
 
+    if "file_id" in block or "file_url" in block:
+        raise ResponsesConversionError(
+            f"{field_name} file ID and file URL references are not supported"
+        )
     image_value = block.get("image_url")
     if isinstance(image_value, dict):
+        if "file_id" in image_value or "file_url" in image_value:
+            raise ResponsesConversionError(
+                f"{field_name} file ID and file URL references are not supported"
+            )
         image_url = image_value.get("url")
     else:
         image_url = image_value
-    if not isinstance(image_url, str) or not image_url.startswith("data:"):
+    if not isinstance(image_url, str):
+        raise ResponsesConversionError(
+            f"{field_name} requires a base64 image data URL; remote URLs and file references are not supported"
+        )
+    if image_url.lower().startswith(("http://", "https://", "file://")):
+        raise ResponsesConversionError(
+            f"{field_name} remote URLs and file URLs are not supported; use an inline base64 image data URL"
+        )
+    if not image_url.startswith("data:"):
         raise ResponsesConversionError(
             f"{field_name} only supports base64 data URL images"
+        )
+    try:
+        header, data = image_url.split(",", 1)
+    except ValueError as exc:
+        raise ResponsesConversionError(
+            f"{field_name} requires a complete base64 image data URL"
+        ) from exc
+    metadata = header[5:].split(";")
+    media_type = metadata[0].lower()
+    if not media_type.startswith("image/") or "base64" not in {
+        value.lower() for value in metadata[1:]
+    } or not data:
+        raise ResponsesConversionError(
+            f"{field_name} requires a non-empty base64 image data URL"
         )
     return {"type": "image_url", "image_url": {"url": image_url}}
 
@@ -213,6 +268,16 @@ def _convert_tool_call(item: ResponsesInputItem) -> Dict[str, Any]:
     arguments = item.arguments if item.arguments is not None else "{}"
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False)
+    try:
+        parsed_arguments = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        raise ResponsesConversionError(
+            f"function_call '{item.call_id}' arguments must be valid JSON"
+        ) from exc
+    if not isinstance(parsed_arguments, dict):
+        raise ResponsesConversionError(
+            f"function_call '{item.call_id}' arguments must be a JSON object"
+        )
     return {
         "id": item.call_id,
         "type": "function",
@@ -290,7 +355,7 @@ def _convert_input_item(item: ResponsesInputItem) -> ResponsesInputItemIR:
             text = _extract_instruction_text(readable_summary, "reasoning")
         elif summary is not None:
             text = _extract_instruction_text(summary, "reasoning")
-        elif "encrypted_content" in item_data or "encrypted_text" in item_data:
+        elif item_data.get("encrypted_content") is not None or item_data.get("encrypted_text") is not None:
             text = ""
         else:
             text = _extract_instruction_text(item.content, "reasoning")
@@ -329,6 +394,10 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[ResponsesToolI
     converted: List[ResponsesToolIR] = []
     for tool in tools or []:
         tool_type = tool.get("type")
+        if not isinstance(tool_type, str):
+            raise ResponsesConversionError(
+                f"Unsupported Responses tool type: {tool_type or 'missing type'}"
+            )
         if tool_type in _HOSTED_TOOL_TYPES:
             raise ResponsesConversionError(
                 f"Hosted Tool '{tool_type}' is not supported by KiroaaS Responses"
@@ -347,6 +416,10 @@ def _convert_tools(tools: Optional[List[Dict[str, Any]]]) -> List[ResponsesToolI
             parameters = {}
         if not isinstance(parameters, dict):
             raise ResponsesConversionError(f"Tool '{name}' parameters must be an object")
+        if tool.get("strict") is True or function.get("strict") is True:
+            raise ResponsesConversionError(
+                f"Tool '{name}' strict schema guarantees are not supported"
+            )
         converted.append(
             ResponsesToolIR(
                 external_type="function",
@@ -366,13 +439,36 @@ def _extract_reasoning_config(request: ResponsesRequest) -> ThinkingConfig:
     if effort is None:
         return ThinkingConfig()
     if effort == "none":
-        return ThinkingConfig(enabled=False)
-    if effort not in THINKING_BUDGETS:
+        return ThinkingConfig(
+            enabled=False,
+            enforce_budget_cap=False,
+            include_system_guidance=False,
+        )
+    if not isinstance(effort, str) or effort not in THINKING_BUDGETS:
         allowed = ", ".join(["none", *THINKING_BUDGETS.keys()])
         raise ResponsesConversionError(
             f"Unsupported reasoning effort '{effort}'. Allowed values: {allowed}"
         )
-    return ThinkingConfig(enabled=True, budget_tokens=THINKING_BUDGETS[effort])
+    return ThinkingConfig(
+        enabled=True,
+        budget_tokens=THINKING_BUDGETS[effort],
+        enforce_budget_cap=False,
+    )
+
+
+def _extract_verbosity(request: ResponsesRequest) -> Optional[str]:
+    """Return the validated best-effort response verbosity preference."""
+    if not request.text:
+        return None
+    verbosity = request.text.get("verbosity")
+    if verbosity is None:
+        return None
+    if not isinstance(verbosity, str) or verbosity not in _VERBOSITY_VALUES:
+        allowed = ", ".join(sorted(_VERBOSITY_VALUES))
+        raise ResponsesConversionError(
+            f"Unsupported text verbosity '{verbosity}'. Allowed values: {allowed}"
+        )
+    return verbosity
 
 
 def _validate_request_capabilities(request: ResponsesRequest) -> None:
@@ -383,11 +479,11 @@ def _validate_request_capabilities(request: ResponsesRequest) -> None:
         )
     if request.store is True:
         raise ResponsesConversionError("Responses storage is not supported; omit store or set store=false")
-    if request.previous_response_id:
+    if request.previous_response_id is not None:
         raise ResponsesConversionError("previous_response_id is not supported; resend the full input")
-    if request.conversation:
+    if request.conversation is not None:
         raise ResponsesConversionError("Stateful conversations are not supported")
-    if request.prompt:
+    if request.prompt is not None:
         raise ResponsesConversionError("Prompt templates are not supported; send full input")
     if request.background is True:
         raise ResponsesConversionError("background Responses are not supported")
@@ -399,6 +495,7 @@ def _validate_request_capabilities(request: ResponsesRequest) -> None:
         text_format = request.text.get("format")
         if text_format is not None and text_format != {"type": "text"}:
             raise ResponsesConversionError("Structured output formats are not supported")
+        _extract_verbosity(request)
     if request.tool_choice is not None and request.tool_choice != "auto":
         raise ResponsesConversionError("Only automatic client tool choice is supported")
     if request.parallel_tool_calls is False:
@@ -434,7 +531,7 @@ def _validate_request_capabilities(request: ResponsesRequest) -> None:
             "Responses encrypted reasoning inclusion requested; unavailable content omitted"
         )
     if request.text:
-        unsupported_text_fields = set(request.text) - {"format"}
+        unsupported_text_fields = set(request.text) - {"format", "verbosity"}
         if unsupported_text_fields:
             raise ResponsesConversionError(
                 "Unsupported Responses text fields: "
@@ -494,6 +591,11 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
     for item in items:
         if item.role in {"system", "developer"} and item.text:
             instruction_segments.append(item.text)
+    verbosity = _extract_verbosity(request)
+    if verbosity:
+        instruction_segments.append(
+            f"Response verbosity preference: {verbosity}. Treat this as a best-effort style preference."
+        )
     system_prompt = "\n\n".join(instruction_segments)
 
     messages: List[UnifiedMessage] = []

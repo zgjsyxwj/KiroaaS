@@ -62,6 +62,8 @@ class ThinkingConfig:
     Attributes:
         enabled: Whether to inject thinking tags into the request
         budget_tokens: Token budget for thinking (None = use FAKE_REASONING_MAX_TOKENS default)
+        enforce_budget_cap: Whether the deployment-wide fake reasoning cap applies
+        include_system_guidance: Whether to include the shared thinking-mode guidance
     
     Examples:
         >>> # Default configuration (enabled with default budget)
@@ -78,6 +80,8 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    enforce_budget_cap: bool = True
+    include_system_guidance: bool = True
 
 
 @dataclass
@@ -400,7 +404,11 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
         effective_budget = FAKE_REASONING_MAX_TOKENS
     
     # Apply cap if enabled
-    if FAKE_REASONING_BUDGET_CAP > 0 and effective_budget > FAKE_REASONING_BUDGET_CAP:
+    if (
+        thinking_config.enforce_budget_cap
+        and FAKE_REASONING_BUDGET_CAP > 0
+        and effective_budget > FAKE_REASONING_BUDGET_CAP
+    ):
         logger.warning(
             f"Client requested thinking budget {effective_budget} exceeds cap {FAKE_REASONING_BUDGET_CAP}. "
             f"Using capped value {FAKE_REASONING_BUDGET_CAP}. "
@@ -1409,7 +1417,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    allow_payload_trim: bool = True,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1425,6 +1434,8 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        allow_payload_trim: Whether the shared legacy auto-trim behavior may
+            remove conversation history to fit the Kiro byte limit
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1444,7 +1455,11 @@ def build_kiro_payload(
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
     # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
+    thinking_system_addition = (
+        get_thinking_system_prompt_addition()
+        if thinking_config.include_system_guidance
+        else ""
+    )
     if thinking_system_addition:
         full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
@@ -1585,7 +1600,7 @@ def build_kiro_payload(
         payload["profileArn"] = profile_arn
 
     # Payload size guard — auto-trim if enabled
-    if AUTO_TRIM_PAYLOAD:
+    if AUTO_TRIM_PAYLOAD and allow_payload_trim:
         payload_size = check_payload_size(payload)
         if payload_size > KIRO_MAX_PAYLOAD_BYTES:
             stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)

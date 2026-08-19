@@ -92,6 +92,13 @@ async def _read_upstream_error(
         error_info.reason,
         response.status_code,
     )
+    if error_info.reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD":
+        return (
+            error_info.user_message
+            + " Reduce the client-owned history, images, or tool definitions and retry; "
+            "KiroaaS does not trim or summarize Responses input.",
+            error_info.reason,
+        )
     return error_info.user_message, error_info.reason
 
 
@@ -148,11 +155,16 @@ async def create_response(request: Request, request_data: ResponsesRequest) -> J
         model_resolution = model_resolver.resolve(request_data.model)
         auth_manager = account.auth_manager
         profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
-        payload_result = build_responses_kiro_payload(
-            request_ir,
-            profile_arn,
-            model_resolution.internal_id,
-        )
+        try:
+            payload_result = build_responses_kiro_payload(
+                request_ir,
+                profile_arn,
+                model_resolution.internal_id,
+            )
+        except ResponsesConversionError as exc:
+            if debug_logger:
+                debug_logger.flush_on_error(400, str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         logger.info(
             "Responses request accepted: response_id={} external_model={} kiro_model={} "
             "account={} items={} tools={} input_chars={}",
