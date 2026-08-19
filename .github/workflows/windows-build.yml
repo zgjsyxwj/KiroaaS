@@ -103,7 +103,12 @@ jobs:
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-        run: ./build-windows.ps1
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_PRIVATE_KEY)) {
+            Remove-Item Env:TAURI_PRIVATE_KEY -ErrorAction SilentlyContinue
+            Remove-Item Env:TAURI_KEY_PASSWORD -ErrorAction SilentlyContinue
+          }
+          ./build-windows.ps1
 
       - name: Scan build outputs with Microsoft Defender
         shell: pwsh
