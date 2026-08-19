@@ -519,13 +519,15 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
-| `/v1/responses` | POST | Stateless, non-streaming OpenAI Responses API |
+| `/v1/responses` | POST | Stateless OpenAI Responses API (streaming and non-streaming; Client Tools) |
 
 ---
 
 ## 💡 Usage Examples
 
 ### OpenAI API
+
+> Codex CLI/App Responses Provider 配置、能力限制、fixture provenance 与发布门槛见 [`docs/codex-responses-provider.md`](../docs/codex-responses-provider.md)。
 
 <details>
 <summary>🔹 Simple cURL Request</summary>

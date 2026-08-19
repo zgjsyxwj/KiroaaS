@@ -1,0 +1,68 @@
+{
+  "provenance": {
+    "kind": "adversarial_aws_stream",
+    "source": "Synthetic AWS Event Stream boundary fixture for issue #10",
+    "source_type": "synthetic_test_data",
+    "captured_at": null,
+    "recorded_at": "2026-08-19",
+    "not_kiroproxy_capture": true,
+    "note": "Frame bytes are deliberately split at prelude, header, payload, UTF-8, and CRC boundaries."
+  },
+  "wire_format": "aws_event_stream",
+  "chunk_ends": [
+    1,
+    4,
+    8,
+    12,
+    34,
+    35,
+    54,
+    58,
+    59,
+    62,
+    66,
+    70,
+    92,
+    93,
+    105,
+    106,
+    108,
+    114,
+    118,
+    119,
+    122,
+    126,
+    130,
+    152,
+    153,
+    165,
+    169,
+    170,
+    173,
+    177,
+    181,
+    203,
+    204,
+    234,
+    238
+  ],
+  "wire_base64": "AAAAOgAAABZ6Z8ofDTptZXNzYWdlLXR5cGUHAAVldmVudHsiY29udGVudCI6IkhlbGxvICJ9vLELgAAAADwAAAAW9Sc/vw06bWVzc2FnZS10eXBlBwAFZXZlbnR7ImNvbnRlbnQiOiLot6hjaHVuayJ98W2EjQAAADMAAAAWd3eobg06bWVzc2FnZS10eXBlBwAFZXZlbnR7InVzYWdlIjoxLjJ9LJaqEQAAAEUAAAAWAeW9AQ06bWVzc2FnZS10eXBlBwAFZXZlbnR7ImNvbnRleHRVc2FnZVBlcmNlbnRhZ2UiOjQyLjV94vS5kw==",
+  "expected_events": [
+    {
+      "type": "content",
+      "data": "Hello "
+    },
+    {
+      "type": "content",
+      "data": "跨chunk"
+    },
+    {
+      "type": "usage",
+      "data": 1.2
+    },
+    {
+      "type": "context_usage",
+      "data": 42.5
+    }
+  ]
+}

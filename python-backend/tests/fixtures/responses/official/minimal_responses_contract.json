@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "kind": "official_contract",
+    "source": "https://developers.openai.com/api/reference/resources/responses/streaming-events",
+    "source_type": "official_documentation",
+    "captured_at": null,
+    "recorded_at": "2026-08-19",
+    "not_kiroproxy_capture": true,
+    "note": "Minimal contract distilled from the official event examples; not a wire capture."
+  },
+  "request": {
+    "model": "gpt-5.6-sol",
+    "input": "Return one short sentence.",
+    "stream": false
+  },
+  "response": {
+    "id": "resp_official_contract",
+    "object": "response",
+    "status": "completed",
+    "model": "gpt-5.6-sol",
+    "output": [
+      {
+        "id": "msg_official_contract",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "One short sentence.",
+            "annotations": []
+          }
+        ]
+      }
+    ]
+  },
+  "stream": {
+    "events": [
+      {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+          "id": "resp_official_contract",
+          "object": "response",
+          "status": "in_progress",
+          "output": []
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {
+          "id": "msg_official_contract",
+          "type": "message",
+          "role": "assistant",
+          "content": []
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "sequence_number": 2,
+        "item_id": "msg_official_contract",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "One short sentence."
+      },
+      {
+        "type": "response.output_text.done",
+        "sequence_number": 3,
+        "item_id": "msg_official_contract",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "One short sentence."
+      },
+      {
+        "type": "response.output_item.done",
+        "sequence_number": 4,
+        "output_index": 0,
+        "item": {
+          "id": "msg_official_contract",
+          "type": "message",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "sequence_number": 5,
+        "response": {
+          "id": "resp_official_contract",
+          "object": "response",
+          "status": "completed",
+          "output": []
+        }
+      }
+    ]
+  }
+}

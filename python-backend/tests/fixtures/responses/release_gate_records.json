@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "purpose": "Issue #10 machine-readable release-gate result",
+  "evaluated_at": "2026-08-19",
+  "required_gates": [
+    "kiro_auth_model_discovery",
+    "kiro_non_stream_text",
+    "kiro_stream_text",
+    "kiro_unsupported_capability_error",
+    "network_isolated_fixture_tests",
+    "chat_completions_regression",
+    "anthropic_regression",
+    "frontend_tests_and_build",
+    "codex_cli_auth_model_discovery",
+    "codex_cli_non_stream_text",
+    "codex_cli_stream_text",
+    "codex_cli_single_client_tool_loop",
+    "codex_cli_multi_tool_call",
+    "codex_cli_cancel",
+    "codex_cli_unsupported_capability_error",
+    "codex_app_text",
+    "codex_app_client_tool_loop"
+  ],
+  "expected_release_ready": false,
+  "expected_blocking_gates": [
+    "kiro_non_stream_text",
+    "kiro_stream_text",
+    "codex_cli_auth_model_discovery",
+    "codex_cli_non_stream_text",
+    "codex_cli_stream_text",
+    "codex_cli_single_client_tool_loop",
+    "codex_cli_multi_tool_call",
+    "codex_cli_cancel",
+    "codex_cli_unsupported_capability_error",
+    "codex_app_text",
+    "codex_app_client_tool_loop"
+  ],
+  "records": [
+    {
+      "name": "kiro_auth_model_discovery",
+      "status": "passed",
+      "client": "KiroaaS + local Kiro AWS SSO OIDC",
+      "version": "local-2026-08-19",
+      "request_phase": "GET /v1/models",
+      "protocol_difference": null
+    },
+    {
+      "name": "kiro_non_stream_text",
+      "status": "failed",
+      "client": "KiroaaS + local Kiro AWS SSO OIDC",
+      "version": "local-2026-08-19",
+      "request_phase": "POST /v1/responses stream=false before response.created",
+      "protocol_difference": "Kiro runtime connection failed; HTTP 502 after three upstream attempts"
+    },
+    {
+      "name": "kiro_stream_text",
+      "status": "failed",
+      "client": "KiroaaS + local Kiro AWS SSO OIDC",
+      "version": "local-2026-08-19",
+      "request_phase": "POST /v1/responses stream=true before response.created",
+      "protocol_difference": "Kiro runtime connection failed; no SSE event was emitted and HTTP 502 was returned"
+    },
+    {
+      "name": "kiro_unsupported_capability_error",
+      "status": "passed",
+      "client": "KiroaaS route",
+      "version": "local-2026-08-19",
+      "request_phase": "POST /v1/responses with web_search_preview",
+      "protocol_difference": null
+    },
+    {
+      "name": "network_isolated_fixture_tests",
+      "status": "passed",
+      "client": "pytest fixture harness",
+      "version": "local-2026-08-19",
+      "request_phase": "fixture load and strict AWS parser",
+      "protocol_difference": null
+    },
+    {
+      "name": "chat_completions_regression",
+      "status": "passed",
+      "client": "pytest backend suite",
+      "version": "local-2026-08-19",
+      "request_phase": "full backend regression",
+      "protocol_difference": null
+    },
+    {
+      "name": "anthropic_regression",
+      "status": "passed",
+      "client": "pytest backend suite",
+      "version": "local-2026-08-19",
+      "request_phase": "full backend regression",
+      "protocol_difference": null
+    },
+    {
+      "name": "frontend_tests_and_build",
+      "status": "passed",
+      "client": "npm test and npm run build",
+      "version": "local-2026-08-19",
+      "request_phase": "frontend verification",
+      "protocol_difference": null
+    },
+    {
+      "name": "codex_cli_auth_model_discovery",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_non_stream_text",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_stream_text",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_single_client_tool_loop",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_multi_tool_call",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_cancel",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_cli_unsupported_capability_error",
+      "status": "not_verified",
+      "client": "Codex CLI",
+      "version": "0.147.0",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex CLI request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_app_text",
+      "status": "not_verified",
+      "client": "Codex App",
+      "version": "26.814.41407",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex App request was executed; corresponding client evidence is unavailable"
+    },
+    {
+      "name": "codex_app_client_tool_loop",
+      "status": "not_verified",
+      "client": "Codex App",
+      "version": "26.814.41407",
+      "request_phase": "not run by instruction",
+      "protocol_difference": "No Codex App request was executed; corresponding client evidence is unavailable"
+    }
+  ]
+}

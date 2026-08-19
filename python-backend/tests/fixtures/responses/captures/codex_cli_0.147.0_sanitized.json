@@ -1,0 +1,16 @@
+{
+  "provenance": {
+    "kind": "sanitized_codex_capture",
+    "source": "Current Codex CLI release gate record",
+    "source_type": "client_capture_slot",
+    "client": "codex_cli",
+    "version": "0.147.0",
+    "status": "not_verified",
+    "captured_at": null,
+    "recorded_at": "2026-08-19",
+    "sanitized": true,
+    "not_kiroproxy_capture": true,
+    "note": "No CLI request was captured in this run by explicit instruction. Do not treat this slot as compatibility evidence."
+  },
+  "capture": null
+}

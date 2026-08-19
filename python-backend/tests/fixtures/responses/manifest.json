@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "purpose": "Issue #10 Responses release-gate evidence registry",
+  "fixtures": [
+    {
+      "path": "official/minimal_responses_contract.json",
+      "kind": "official_contract",
+      "provenance": {
+        "source": "https://developers.openai.com/api/reference/resources/responses/streaming-events",
+        "source_type": "official_documentation",
+        "captured_at": null,
+        "recorded_at": "2026-08-19",
+        "not_kiroproxy_capture": true
+      }
+    },
+    {
+      "path": "captures/codex_cli_0.147.0_sanitized.json",
+      "kind": "sanitized_codex_capture",
+      "provenance": {
+        "source": "Current Codex CLI release gate record",
+        "source_type": "client_capture_slot",
+        "captured_at": null,
+        "recorded_at": "2026-08-19",
+        "not_kiroproxy_capture": true,
+        "client": "codex_cli",
+        "version": "0.147.0",
+        "status": "not_verified"
+      }
+    },
+    {
+      "path": "captures/codex_app_26.814.41407_sanitized.json",
+      "kind": "sanitized_codex_capture",
+      "provenance": {
+        "source": "Current Codex App release gate record",
+        "source_type": "client_capture_slot",
+        "captured_at": null,
+        "recorded_at": "2026-08-19",
+        "not_kiroproxy_capture": true,
+        "client": "codex_app",
+        "version": "26.814.41407",
+        "status": "not_verified"
+      }
+    },
+    {
+      "path": "adversarial/aws_cross_chunk_stream.json",
+      "kind": "adversarial_aws_stream",
+      "provenance": {
+        "source": "Synthetic AWS Event Stream boundary fixture for issue #10",
+        "source_type": "synthetic_test_data",
+        "captured_at": null,
+        "recorded_at": "2026-08-19",
+        "not_kiroproxy_capture": true
+      }
+    }
+  ]
+}
