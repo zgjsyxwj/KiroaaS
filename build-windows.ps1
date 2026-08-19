@@ -1,3 +1,7 @@
+param(
+    [switch]$InstallerOnly
+)
+
 # KiroaaS Windows Build Script
 $ErrorActionPreference = "Stop"
 
@@ -82,7 +86,15 @@ if (Test-Path $keyPath) {
 } else {
     Write-Host "Warning: Signing key not found at $keyPath, building without updater signing"
 }
-npm run tauri:build
+if ($InstallerOnly) {
+    npm run tauri:build -- --bundles msi nsis
+} else {
+    npm run tauri:build
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: Tauri build failed"
+    exit 1
+}
 
 Write-Host ""
 Write-Host "=== Build Complete ==="

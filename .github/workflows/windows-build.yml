@@ -107,14 +107,11 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_PRIVATE_KEY)) {
             Remove-Item Env:TAURI_PRIVATE_KEY -ErrorAction SilentlyContinue
             Remove-Item Env:TAURI_KEY_PASSWORD -ErrorAction SilentlyContinue
-
-            $configPath = "src-tauri/tauri.conf.json"
-            $config = Get-Content $configPath -Raw | ConvertFrom-Json
-            $config.tauri.updater.active = $false
-            $config | ConvertTo-Json -Depth 100 | Set-Content $configPath -Encoding utf8
-            Write-Host "Updater artifacts are disabled because no updater signing key is configured."
+            Write-Host "Building MSI and NSIS installers without updater artifacts."
+            ./build-windows.ps1 -InstallerOnly
+          } else {
+            ./build-windows.ps1
           }
-          ./build-windows.ps1
 
       - name: Scan build outputs with Microsoft Defender
         shell: pwsh
