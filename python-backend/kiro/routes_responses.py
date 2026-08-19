@@ -13,7 +13,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.account_errors import ErrorType, classify_error
+from kiro.auth import KiroAuthManager
 from kiro.config import FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT, PROFILE_ARN
+from kiro.converters_core import KiroPayloadResult
 from kiro.converters_responses import (
     ResponsesConversionError,
     ResponsesRequestIR,
@@ -60,12 +62,92 @@ class _PreparedResponsesStream:
     state: ResponsesStreamState
 
 
+@dataclass(frozen=True)
+class _ResponsesUpstreamRequest:
+    """Resolved account, authentication, payload, and endpoint for one request."""
+
+    account: Any
+    auth_manager: KiroAuthManager
+    payload_result: KiroPayloadResult
+    url: str
+
+
+async def _build_responses_upstream_request(
+    request: Request,
+    request_data: ResponsesRequest,
+    request_ir: ResponsesRequestIR,
+    response_id: str,
+    exclude_accounts: Optional[set[str]] = None,
+) -> _ResponsesUpstreamRequest:
+    """Resolve account state and build the shared Kiro request payload.
+
+    Args:
+        request: FastAPI request containing account and application state.
+        request_data: Validated public Responses request.
+        request_ir: Converted request intermediate representation.
+        response_id: Public response identity used for diagnostics.
+        exclude_accounts: Account IDs already attempted for this request.
+
+    Returns:
+        Account and request data required for an upstream generation.
+
+    Raises:
+        HTTPException: If account state is incomplete or conversion fails.
+    """
+    account = await _select_account(
+        request,
+        request_data.model,
+        exclude_accounts=exclude_accounts,
+    )
+    if account.model_resolver is None:
+        raise HTTPException(status_code=503, detail="The selected account has no model resolver")
+    auth_manager = account.auth_manager
+    if auth_manager is None:
+        raise HTTPException(status_code=503, detail="The selected account has no Kiro authentication")
+    model_resolution = account.model_resolver.resolve(request_data.model)
+    profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
+    try:
+        payload_result = build_responses_kiro_payload(
+            request_ir,
+            profile_arn,
+            model_resolution.internal_id,
+        )
+    except ResponsesConversionError as exc:
+        if debug_logger:
+            debug_logger.flush_on_error(400, str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info(
+        "Responses request accepted: response_id={} external_model={} kiro_model={} "
+        "account={} items={} tools={} input_chars={}",
+        response_id,
+        request_data.model,
+        model_resolution.internal_id,
+        account.id,
+        len(request_ir.items),
+        len(request_ir.tools),
+        sum(len(item.text) for item in request_ir.items),
+    )
+    return _ResponsesUpstreamRequest(
+        account=account,
+        auth_manager=auth_manager,
+        payload_result=payload_result,
+        url=f"{auth_manager.api_host}/generateAssistantResponse",
+    )
+
+
 async def _close_upstream_resources(
     http_client: KiroHttpClient,
     upstream_response: Optional[httpx.Response],
     parsed_stream: Optional[AsyncGenerator[KiroEvent, None]],
 ) -> None:
-    """Close a parser, response, and request-scoped client in dependency order."""
+    """Close a parser, response, and request-scoped client in dependency order.
+
+    Args:
+        http_client: Request-scoped Kiro HTTP client.
+        upstream_response: Optional response that owns the upstream byte stream.
+        parsed_stream: Optional parser generator consuming that response.
+    """
     if parsed_stream is not None:
         try:
             await parsed_stream.aclose()
@@ -146,7 +228,16 @@ async def _read_upstream_error(
 
 
 def _error_response(status_code: int, message: str, error_type: str = "kiro_api_error") -> JSONResponse:
-    """Build the public pre-stream error shape without echoing upstream bodies."""
+    """Build a public pre-stream error without echoing upstream bodies.
+
+    Args:
+        status_code: HTTP status returned to the client.
+        message: Sanitized actionable error message.
+        error_type: Public error category.
+
+    Returns:
+        A JSON response in the gateway's error shape.
+    """
     return JSONResponse(
         status_code=status_code,
         content={
@@ -167,6 +258,15 @@ async def _prepare_responses_stream(
 ) -> Union[_PreparedResponsesStream, JSONResponse]:
     """Prepare and prefetch a stream while ordinary HTTP errors are still possible.
 
+    Args:
+        request: FastAPI request containing account and client state.
+        request_data: Validated public Responses request.
+        request_ir: Converted request intermediate representation.
+        response_id: Identity to use for the public lifecycle.
+
+    Returns:
+        Prepared stream resources or an ordinary pre-stream JSON error.
+
     The first Kiro event is buffered before returning. This lets the route
     perform token refresh, generation retry, and account failover without
     emitting a Responses event that would make a retry ambiguous.
@@ -180,50 +280,27 @@ async def _prepare_responses_stream(
     last_error_status = 502
 
     for _ in range(max(max_accounts, 1)):
-        account = await _select_account(
-            request,
-            request_data.model,
-            exclude_accounts=tried_accounts if account_system else None,
-        )
+        try:
+            upstream_request = await _build_responses_upstream_request(
+                request,
+                request_data,
+                request_ir,
+                response_id,
+                exclude_accounts=tried_accounts if account_system else None,
+            )
+        except HTTPException as exc:
+            if not account_system or exc.status_code == 400:
+                raise
+            last_error_message = str(exc.detail)
+            last_error_status = exc.status_code
+            continue
+        account = upstream_request.account
         if account_system:
             tried_accounts.add(account.id)
-        if account.model_resolver is None:
-            last_error_message = "The selected account has no model resolver"
-            last_error_status = 503
-            continue
-
-        model_resolution = account.model_resolver.resolve(request_data.model)
-        auth_manager = account.auth_manager
-        if auth_manager is None:
-            last_error_message = "The selected account has no Kiro authentication"
-            last_error_status = 503
-            continue
-        profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
-        try:
-            payload_result = build_responses_kiro_payload(
-                request_ir,
-                profile_arn,
-                model_resolution.internal_id,
-            )
-        except ResponsesConversionError as exc:
-            if debug_logger:
-                debug_logger.flush_on_error(400, str(exc))
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        logger.info(
-            "Responses stream accepted: response_id={} external_model={} kiro_model={} "
-            "account={} items={} tools={} input_chars={}",
-            response_id,
-            request_data.model,
-            model_resolution.internal_id,
-            account.id,
-            len(request_ir.items),
-            len(request_ir.tools),
-            sum(len(item.text) for item in request_ir.items),
-        )
-
+        auth_manager = upstream_request.auth_manager
+        payload_result = upstream_request.payload_result
         http_client = KiroHttpClient(auth_manager)
-        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        url = upstream_request.url
         account_stream_succeeded = False
         account_should_failover = False
 
@@ -375,8 +452,20 @@ async def _stream_responses_body(
     request: Request,
     prepared: _PreparedResponsesStream,
 ) -> AsyncGenerator[str, None]:
-    """Yield the prepared stream and always release request-scoped resources."""
+    """Yield the prepared stream and always release request-scoped resources.
+
+    Args:
+        request: Client request used for disconnect checks and accounting.
+        prepared: Prefetched upstream stream and lifecycle state.
+
+    Yields:
+        Data-only Responses SSE records.
+
+    Raises:
+        asyncio.CancelledError: When the client disconnects or cancels.
+    """
     state = prepared.state
+    account_manager = request.app.state.account_manager
     try:
         if await request.is_disconnected():
             raise asyncio.CancelledError()
@@ -391,7 +480,7 @@ async def _stream_responses_body(
                 yield encode_response_sse(event)
         for event in state.complete():
             yield encode_response_sse(event)
-        await request.app.state.account_manager.report_success(
+        await account_manager.report_success(
             prepared.account.id,
             state.request.model,
         )
@@ -404,7 +493,7 @@ async def _stream_responses_body(
         for event in state.fail(exc):
             yield encode_response_sse(event)
         try:
-            await request.app.state.account_manager.report_failure(
+            await account_manager.report_failure(
                 prepared.account.id,
                 state.request.model,
                 ErrorType.RECOVERABLE,
@@ -478,51 +567,26 @@ async def create_response(
     last_error_status = 502
 
     for attempt in range(max(max_attempts, 1)):
-        account = await _select_account(
-            request,
-            request_data.model,
-            exclude_accounts=tried_accounts if account_system else None,
-        )
+        try:
+            upstream_request = await _build_responses_upstream_request(
+                request,
+                request_data,
+                request_ir,
+                response_id,
+                exclude_accounts=tried_accounts if account_system else None,
+            )
+        except HTTPException as exc:
+            if not account_system or exc.status_code == 400:
+                raise
+            last_error_message = str(exc.detail)
+            last_error_status = exc.status_code
+            continue
+        account = upstream_request.account
         if account_system:
             tried_accounts.add(account.id)
-
-        model_resolver = account.model_resolver
-        if model_resolver is None:
-            if not account_system:
-                raise HTTPException(
-                    status_code=503,
-                    detail="The selected account has no model resolver",
-                )
-            last_error_message = "The selected account has no model resolver"
-            last_error_status = 503
-            continue
-
-        model_resolution = model_resolver.resolve(request_data.model)
-        auth_manager = account.auth_manager
-        profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
-        try:
-            payload_result = build_responses_kiro_payload(
-                request_ir,
-                profile_arn,
-                model_resolution.internal_id,
-            )
-        except ResponsesConversionError as exc:
-            if debug_logger:
-                debug_logger.flush_on_error(400, str(exc))
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        logger.info(
-            "Responses request accepted: response_id={} external_model={} kiro_model={} "
-            "account={} items={} tools={} input_chars={}",
-            response_id,
-            request_data.model,
-            model_resolution.internal_id,
-            account.id,
-            len(request_ir.items),
-            len(request_ir.tools),
-            sum(len(item.text) for item in request_ir.items),
-        )
-
-        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        auth_manager = upstream_request.auth_manager
+        payload_result = upstream_request.payload_result
+        url = upstream_request.url
         # The public endpoint buffers the stream, but the upstream request remains
         # streaming and therefore owns a request-scoped client.
         http_client = KiroHttpClient(auth_manager)

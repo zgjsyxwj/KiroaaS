@@ -255,7 +255,11 @@ class AwsEventStreamParser:
     _MAX_FRAME_LENGTH = 16 * 1024 * 1024
 
     def __init__(self, allow_legacy_json: bool = True):
-        """Initializes the parser."""
+        """Initialize a buffered AWS Event Stream parser.
+
+        Args:
+            allow_legacy_json: Permit the old raw-JSON fixture compatibility mode.
+        """
         self._wire_buffer = b""
         self._mode: Optional[str] = None
         self._allow_legacy_json = allow_legacy_json
@@ -297,7 +301,14 @@ class AwsEventStreamParser:
         return self._feed_aws_frames()
 
     def _detect_mode(self) -> Optional[str]:
-        """Detect a real AWS stream or the repository's legacy JSON fixture."""
+        """Detect a real AWS stream or the repository's legacy JSON fixture.
+
+        Returns:
+            ``"aws"``, ``"legacy"``, or ``None`` while the prefix is incomplete.
+
+        Raises:
+            ValueError: If the prefix cannot be a valid strict AWS frame.
+        """
         stripped = self._wire_buffer.lstrip()
         if stripped.startswith((b"{", b"[")):
             if not self._allow_legacy_json:
@@ -318,7 +329,14 @@ class AwsEventStreamParser:
         raise ValueError(f"Invalid AWS Event Stream total length: {total_length}")
 
     def _feed_legacy(self, chunk: bytes) -> List[Dict[str, Any]]:
-        """Parse a legacy raw-JSON fixture stream without treating it as AWS."""
+        """Parse a legacy raw-JSON fixture stream without treating it as AWS.
+
+        Args:
+            chunk: Newly received transport bytes.
+
+        Returns:
+            Parsed compatibility events.
+        """
         try:
             self.buffer += self._utf8_decoder.decode(chunk, final=False)
         except (UnicodeError, TypeError):
@@ -326,7 +344,14 @@ class AwsEventStreamParser:
         return self._parse_json_buffer(deduplicate_content=True)
 
     def _feed_aws_frames(self) -> List[Dict[str, Any]]:
-        """Consume complete AWS frames from the buffered wire bytes."""
+        """Consume complete AWS frames from the buffered wire bytes.
+
+        Returns:
+            Events from every complete frame currently buffered.
+
+        Raises:
+            ValueError: If a frame length, CRC, header, or payload is invalid.
+        """
         events: List[Dict[str, Any]] = []
         while True:
             if len(self._wire_buffer) < 12:
@@ -379,7 +404,17 @@ class AwsEventStreamParser:
 
     @staticmethod
     def _parse_headers(raw_headers: bytes) -> Dict[str, Any]:
-        """Decode AWS Event Stream headers and reject malformed lengths/types."""
+        """Decode AWS Event Stream headers and reject malformed lengths/types.
+
+        Args:
+            raw_headers: Header section without prelude or message CRC.
+
+        Returns:
+            Decoded header values keyed by header name.
+
+        Raises:
+            ValueError: If a header is truncated, invalid UTF-8, or unsupported.
+        """
         headers: Dict[str, Any] = {}
         position = 0
         while position < len(raw_headers):
@@ -459,14 +494,34 @@ class AwsEventStreamParser:
     def _require_header_bytes(
         raw_headers: bytes, position: int, length: int, name: str
     ) -> int:
-        """Advance a header cursor only when the requested value is complete."""
+        """Advance a header cursor only when the requested value is complete.
+
+        Args:
+            raw_headers: Complete frame header section.
+            position: Current cursor position.
+            length: Required number of value bytes.
+            name: Header name used in diagnostics.
+
+        Returns:
+            Cursor position after the value.
+
+        Raises:
+            ValueError: If the value extends beyond the header section.
+        """
         end = position + length
         if end > len(raw_headers):
             raise ValueError(f"AWS Event Stream header '{name}' is truncated")
         return end
 
     def _parse_json_buffer(self, deduplicate_content: bool) -> List[Dict[str, Any]]:
-        """Parse complete JSON objects from the compatibility buffer."""
+        """Parse complete JSON objects from the compatibility buffer.
+
+        Args:
+            deduplicate_content: Preserve legacy repeated-content behavior.
+
+        Returns:
+            Parsed compatibility events.
+        """
         events: List[Dict[str, Any]] = []
         while True:
             earliest_pos = -1
@@ -495,7 +550,15 @@ class AwsEventStreamParser:
     def _process_payload(
         self, data: Dict[str, Any], deduplicate_content: bool = False
     ) -> Optional[Dict[str, Any]]:
-        """Classify one decoded Kiro payload without relying on transport chunks."""
+        """Classify one decoded Kiro payload without transport-chunk assumptions.
+
+        Args:
+            data: Decoded Kiro JSON object.
+            deduplicate_content: Apply compatibility content deduplication.
+
+        Returns:
+            One normalized event, or ``None`` for an unrecognized payload.
+        """
         for pattern, event_type in self.EVENT_PATTERNS:
             if pattern.startswith("{") and data:
                 key = pattern[len("{"):].split(":", 1)[0].strip('"')
@@ -506,7 +569,11 @@ class AwsEventStreamParser:
         return None
 
     def finalize(self) -> None:
-        """Validate that an AWS stream did not end in the middle of a frame."""
+        """Validate that an AWS stream did not end in the middle of a frame.
+
+        Raises:
+            ValueError: If strict AWS bytes end before a complete frame exists.
+        """
         if self._mode == "aws" and self._wire_buffer:
             raise ValueError("AWS Event Stream ended with a partial frame")
         if self._mode is None and self._wire_buffer and not self._allow_legacy_json:

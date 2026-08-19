@@ -248,13 +248,7 @@ def test_responses_stream_emits_one_ordered_text_lifecycle(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
 
     response = test_client.post(
@@ -288,6 +282,7 @@ def test_responses_stream_emits_one_ordered_text_lifecycle(
     assert [events[3]["delta"], events[4]["delta"]] == ["Hello ", "world"]
     assert events[5]["text"] == "Hello world"
     assert events[-1]["response"]["status"] == "completed"
+    assert events[-1]["response"]["usage"]["total_tokens"] >= 0
 
 
 def test_responses_stream_emits_failed_terminal_after_started_stream(
@@ -304,13 +299,7 @@ def test_responses_stream_emits_failed_terminal_after_started_stream(
         trailing_bytes=b"\x00" * 12,
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -329,6 +318,7 @@ def test_responses_stream_emits_failed_terminal_after_started_stream(
         "partial"
     ]
     assert "partial" not in events[-1]["response"]["error"]["message"]
+    assert events[-1]["response"]["usage"]["total_tokens"] >= 0
 
 
 def test_responses_stream_empty_upstream_still_has_one_terminal_lifecycle(
@@ -342,13 +332,7 @@ def test_responses_stream_empty_upstream_still_has_one_terminal_lifecycle(
 
     transport = KiroResponsesTransport(event_batches=[[]])
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -388,13 +372,7 @@ def test_responses_stream_preserves_function_call_lifecycle_and_call_id(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -447,13 +425,7 @@ def test_responses_stream_upstream_http_error_stays_an_ordinary_http_error(
         error_body=b'{"message":"bad request","reason":"INVALID_MODEL_ID"}',
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -480,13 +452,7 @@ def test_responses_stream_retries_generation_before_first_event(
         prefetch_failures=1,
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -520,13 +486,7 @@ def test_responses_stream_fails_over_only_before_first_event(
         prefetch_failures=1,
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(routes_module, "FIRST_TOKEN_MAX_RETRIES", 1)
     monkeypatch.setattr(app.state, "account_system", True)
 
@@ -732,13 +692,7 @@ def test_responses_high_level_seam_preserves_history_images_and_safe_controls(
 
     transport = KiroResponsesTransport()
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -865,6 +819,36 @@ def test_responses_high_level_seam_reports_actionable_context_limit_error(
     message = response.json()["error"]["message"].lower()
     assert "context limit" in message
     assert "reduce" in message
+
+
+def test_responses_stream_context_limit_is_ordinary_pre_stream_error(
+    test_client,
+    clean_app,
+    valid_proxy_api_key,
+    monkeypatch,
+):
+    """A context-limit rejection before the first event stays ordinary HTTP."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        status_code=400,
+        error_body=b'{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}',
+    )
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={"model": "model", "input": "hello", "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    message = response.json()["error"]["message"].lower()
+    assert "context limit" in message
+    assert "reduce" in message
+    assert "response.created" not in response.text
 
 
 def test_responses_high_level_seam_returns_validation_error_for_malformed_input(

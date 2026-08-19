@@ -23,7 +23,14 @@ from kiro.streaming_core import KiroEvent, StreamResult
 
 
 def encode_response_sse(event: Dict[str, Any]) -> str:
-    """Encode one Responses event as a data-only SSE record."""
+    """Encode one Responses event as a data-only SSE record.
+
+    Args:
+        event: JSON-serializable Responses event.
+
+    Returns:
+        One SSE record terminated by a blank line.
+    """
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
@@ -47,7 +54,14 @@ class ResponsesStreamState:
     _terminal: bool = False
 
     def created_event(self) -> Dict[str, Any]:
-        """Return the single first event that establishes response identity."""
+        """Return the single first event that establishes response identity.
+
+        Returns:
+            The ordered ``response.created`` event.
+
+        Raises:
+            RuntimeError: If the lifecycle was already opened.
+        """
         if self._created:
             raise RuntimeError("Responses response.created was already emitted")
         self._created = True
@@ -57,7 +71,17 @@ class ResponsesStreamState:
         )
 
     def consume(self, event: KiroEvent) -> List[Dict[str, Any]]:
-        """Translate one parsed Kiro event into ordered Responses events."""
+        """Translate one parsed Kiro event into ordered Responses events.
+
+        Args:
+            event: One normalized event from the buffered Kiro parser.
+
+        Returns:
+            Zero or more ordered public events.
+
+        Raises:
+            ResponsesConversionError: If a Kiro tool call is malformed.
+        """
         if self._terminal:
             return []
         if event.type == "content" and event.content:
@@ -77,7 +101,11 @@ class ResponsesStreamState:
         return []
 
     def complete(self) -> List[Dict[str, Any]]:
-        """Close output items and emit exactly one completed terminal event."""
+        """Close output items and emit exactly one completed terminal event.
+
+        Returns:
+            The remaining item/content done events followed by completion.
+        """
         if self._terminal:
             return []
         events = self._finish_text()
@@ -106,7 +134,14 @@ class ResponsesStreamState:
         return events
 
     def fail(self, error: BaseException) -> List[Dict[str, Any]]:
-        """Emit one sanitized terminal failure after response.created."""
+        """Emit one sanitized terminal failure after response.created.
+
+        Args:
+            error: Internal failure used to choose a safe client message.
+
+        Returns:
+            A single ``response.failed`` event, or an empty list if terminal.
+        """
         if not self._created or self._terminal:
             return []
         usage = estimate_responses_usage(
@@ -138,7 +173,14 @@ class ResponsesStreamState:
         ]
 
     def _consume_text(self, delta: str) -> List[Dict[str, Any]]:
-        """Open the text item once and emit exactly one event per text delta."""
+        """Open the text item once and emit exactly one event per text delta.
+
+        Args:
+            delta: Exact text bytes decoded by the upstream parser.
+
+        Returns:
+            Events needed to open the item and publish the delta.
+        """
         events: List[Dict[str, Any]] = []
         if self._text_item is None:
             self._text_output_index = self._allocate_output_index()
@@ -185,7 +227,11 @@ class ResponsesStreamState:
         return events
 
     def _finish_text(self) -> List[Dict[str, Any]]:
-        """Emit text done, content part done, and item done in that order."""
+        """Emit text done, content part done, and item done in that order.
+
+        Returns:
+            Ordered closing events, or an empty list without a text item.
+        """
         if self._text_item is None:
             return []
         item = self._text_item
@@ -217,7 +263,17 @@ class ResponsesStreamState:
         return events
 
     def _consume_tool(self, tool: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Emit a complete Client Tool Call lifecycle from one Kiro tool event."""
+        """Emit a complete Client Tool Call lifecycle from one Kiro tool event.
+
+        Args:
+            tool: Normalized Kiro tool-call payload.
+
+        Returns:
+            Ordered item and argument events for the tool call.
+
+        Raises:
+            ResponsesConversionError: If tool identity or arguments are invalid.
+        """
         function = tool.get("function") or {}
         name = function.get("name") or tool.get("name")
         if not isinstance(name, str) or not name:
@@ -302,7 +358,16 @@ class ResponsesStreamState:
         usage: Optional[Dict[str, Any]],
         error: Optional[Dict[str, str]],
     ) -> Dict[str, Any]:
-        """Build a response object with stable request and output identities."""
+        """Build a response object with stable request and output identities.
+
+        Args:
+            status: Public response status.
+            usage: Final usage object, if the lifecycle is terminal.
+            error: Sanitized error object for a failed lifecycle.
+
+        Returns:
+            A response snapshot containing the current output items.
+        """
         effort = (self.request.reasoning or {}).get("effort")
         return {
             "id": self.response_id,
@@ -347,21 +412,43 @@ class ResponsesStreamState:
         }
 
     def _event(self, event_type: str, **fields: Any) -> Dict[str, Any]:
-        """Assign the next response-local sequence number to one event."""
+        """Assign the next response-local sequence number to one event.
+
+        Args:
+            event_type: Public Responses event type.
+            **fields: Event-specific fields.
+
+        Returns:
+            An event with the next monotonic sequence number.
+        """
         event = {"type": event_type, "sequence_number": self._sequence_number}
         self._sequence_number += 1
         event.update(fields)
         return event
 
     def _allocate_output_index(self) -> int:
-        """Return the next stable output index."""
+        """Return the next stable output index.
+
+        Returns:
+            The next zero-based output index.
+        """
         output_index = self._next_output_index
         self._next_output_index += 1
         return output_index
 
     @staticmethod
     def _safe_error_message(error: BaseException) -> str:
-        """Return an actionable but body-free terminal error message."""
+        """Return an actionable but body-free terminal error message.
+
+        Args:
+            error: Internal error raised while reading the upstream stream.
+
+        Returns:
+            A safe retry-oriented message without generated text or body data.
+        """
         if isinstance(error, ResponsesConversionError):
             return str(error)
-        return "Kiro response generation failed after response.created"
+        return (
+            "Kiro stopped the response after streaming started. "
+            "Retry the request; KiroaaS did not restart the generation."
+        )
