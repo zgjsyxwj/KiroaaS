@@ -1,0 +1,160 @@
+name: Windows Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and scan Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: python-backend/requirements.txt
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          python -m pip install --upgrade pip
+          python -m pip install -r python-backend/requirements.txt pyinstaller
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run backend tests
+        working-directory: python-backend
+        run: python -m pytest
+
+      - name: Configure optional Authenticode certificate
+        id: certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) {
+            "signed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "No Authenticode certificate configured; producing unsigned installers."
+            exit 0
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "WINDOWS_CERTIFICATE_PASSWORD is required when a certificate is configured"
+          }
+
+          $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.tauri.bundle.windows.certificateThumbprint = $certificate.Thumbprint
+          $config.tauri.bundle.windows.timestampUrl = "http://timestamp.digicert.com"
+          $config | ConvertTo-Json -Depth 100 | Set-Content $configPath -Encoding utf8
+          Remove-Item $certificatePath -Force
+
+          "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Authenticode signing is enabled."
+
+      - name: Build Windows application
+        shell: pwsh
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: ./build-windows.ps1
+
+      - name: Scan build outputs with Microsoft Defender
+        shell: pwsh
+        run: |
+          $platformDirectory = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $scanner = Get-ChildItem -Path $platformDirectory -Filter MpCmdRun.exe -Recurse |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $scanner) {
+            throw "Microsoft Defender command-line scanner was not found"
+          }
+
+          $scanTargets = @(
+            "python-backend/build/dist/kiro-gateway",
+            "src-tauri/target/release/kiroaas.exe",
+            "src-tauri/target/release/bundle"
+          )
+          foreach ($target in $scanTargets) {
+            if (-not (Test-Path $target)) {
+              throw "Expected scan target was not found: $target"
+            }
+            & $scanner.FullName -Scan -ScanType 3 -File (Resolve-Path $target)
+            if ($LASTEXITCODE -ne 0) {
+              throw "Microsoft Defender rejected $target with exit code $LASTEXITCODE"
+            }
+          }
+
+      - name: Create checksums and signing report
+        shell: pwsh
+        env:
+          AUTHENTICODE_SIGNED: ${{ steps.certificate.outputs.signed }}
+        run: |
+          $bundleDirectory = Resolve-Path "src-tauri/target/release/bundle"
+          "Authenticode signed: $env:AUTHENTICODE_SIGNED" |
+            Set-Content (Join-Path $bundleDirectory "BUILD-SIGNING.txt") -Encoding utf8
+
+          $checksumPath = Join-Path $bundleDirectory "SHA256SUMS.txt"
+          $lines = Get-ChildItem $bundleDirectory -File -Recurse |
+            Where-Object FullName -ne $checksumPath |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relativePath = [IO.Path]::GetRelativePath($bundleDirectory, $_.FullName).Replace("\", "/")
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $relativePath"
+            }
+          $lines | Set-Content $checksumPath -Encoding utf8
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: KiroaaS-Windows-x64
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

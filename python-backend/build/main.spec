@@ -90,7 +90,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-packed executables trigger more heuristic antivirus detections.
+    # Prefer a larger binary whose contents remain inspectable.
+    upx=False,
     upx_exclude=[],
     console=True,  # Keep console for logging output
     disable_windowed_traceback=False,
@@ -106,7 +108,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='kiro-gateway',
 )
