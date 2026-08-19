@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -427,7 +427,10 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
 
 
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest,
+    conversation_id: str,
+    profile_arn: str,
+    model_id_override: Optional[str] = None,
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -443,6 +446,7 @@ def anthropic_to_kiro(
         request: Anthropic MessagesRequest
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_id_override: Optional Kiro Model ID resolved from account evidence
 
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -462,7 +466,11 @@ def anthropic_to_kiro(
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
+    model_id = model_id_override or get_model_id_for_kiro(
+        request.model,
+        HIDDEN_MODELS,
+        MODEL_ALIASES,
+    )
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)

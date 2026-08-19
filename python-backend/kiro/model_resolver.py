@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 from loguru import logger
 
@@ -189,7 +189,11 @@ def normalize_model_name(name: str) -> str:
     return name
 
 
-def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str:
+def get_model_id_for_kiro(
+    model_name: str,
+    hidden_models: Dict[str, str],
+    aliases: Optional[Mapping[str, str]] = None,
+) -> str:
     """
     Get the model ID to send to Kiro API.
     
@@ -202,6 +206,7 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
     Args:
         model_name: External model name from client
         hidden_models: Dict mapping display names to internal Kiro IDs
+        aliases: Optional mapping of accepted input aliases to external IDs
     
     Returns:
         Model ID to send to Kiro API
@@ -214,7 +219,8 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
-    normalized = normalize_model_name(model_name)
+    resolved_model = (aliases or {}).get(model_name, model_name)
+    normalized = normalize_model_name(resolved_model)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
 
@@ -329,7 +335,16 @@ class ModelResolver:
         # Layer 2: Check dynamic cache (from /ListAvailableModels)
         if self.cache.is_valid_model(normalized):
             logger.debug(f"Model '{normalized}' found in dynamic cache")
-            runtime_id = to_runtime_model_id(normalized)
+            cached_model = self.cache.get(normalized) or {}
+            cached_runtime_id = (
+                cached_model.get("kiroModelId")
+                or cached_model.get("runtimeModelId")
+                or cached_model.get("_internal_id")
+                or normalized
+            )
+            if not isinstance(cached_runtime_id, str) or not cached_runtime_id.strip():
+                cached_runtime_id = normalized
+            runtime_id = to_runtime_model_id(cached_runtime_id)
             return ModelResolution(
                 internal_id=runtime_id,
                 source="cache",

@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
@@ -393,7 +393,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    model_id_override: Optional[str] = None,
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -405,6 +406,7 @@ def build_kiro_payload(
         request_data: Request in OpenAI format
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_id_override: Optional Kiro Model ID resolved from account evidence
     
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -420,7 +422,11 @@ def build_kiro_payload(
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    model_id = model_id_override or get_model_id_for_kiro(
+        request_data.model,
+        HIDDEN_MODELS,
+        MODEL_ALIASES,
+    )
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)

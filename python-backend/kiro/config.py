@@ -230,7 +230,8 @@ HIDDEN_MODELS: Dict[str, str] = {
 # with IDE-specific model names (e.g., Cursor's "auto" model).
 #
 # Format: {"alias_name": "real_model_id"}
-# - alias_name: The name that will appear in /v1/models and can be used in requests
+# - alias_name: An input name that can be used in requests but is hidden from
+#   the canonical /v1/models catalog
 # - real_model_id: The actual model ID that will be sent to Kiro API
 #
 # Use cases:
@@ -274,6 +275,9 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - New models released after this version won't appear here
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
     {"modelId": "auto"},
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
@@ -578,4 +582,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-

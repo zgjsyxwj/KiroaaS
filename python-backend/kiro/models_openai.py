@@ -30,6 +30,9 @@ from typing_extensions import Annotated
 from pydantic import BaseModel, Field
 
 
+_MODEL_CATALOG_CREATED_AT = int(time.time())
+
+
 # ==================================================================================================
 # Models for /v1/models endpoint
 # ==================================================================================================
@@ -42,8 +45,8 @@ class OpenAIModel(BaseModel):
     """
     id: str
     object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "anthropic"
+    created: int = _MODEL_CATALOG_CREATED_AT
+    owned_by: str = "Kiro"
     description: Optional[str] = None
 
 

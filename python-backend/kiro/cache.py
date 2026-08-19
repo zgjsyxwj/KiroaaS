@@ -31,6 +31,10 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
+from kiro.model_catalog import MODEL_SOURCE_DYNAMIC, MODEL_SOURCE_FALLBACK, ModelSource
+
+
+ModelCacheSource = ModelSource
 
 
 class ModelInfoCache:
@@ -61,8 +65,13 @@ class ModelInfoCache:
         self._lock = asyncio.Lock()
         self._last_update: Optional[float] = None
         self._cache_ttl = cache_ttl
+        self._source: Optional[ModelCacheSource] = None
     
-    async def update(self, models_data: List[Dict[str, Any]]) -> None:
+    async def update(
+        self,
+        models_data: List[Dict[str, Any]],
+        source: ModelCacheSource = MODEL_SOURCE_DYNAMIC,
+    ) -> None:
         """
         Updates the model cache.
         
@@ -71,11 +80,19 @@ class ModelInfoCache:
         Args:
             models_data: List of dictionaries with model information.
                         Each dictionary must contain the "modelId" key.
+            source: Evidence source for this cache update. ``dynamic`` is
+                    account discovery evidence; ``fallback`` is curated data.
+
+        Raises:
+            ValueError: If the source is not a supported cache source.
         """
+        if source not in (MODEL_SOURCE_DYNAMIC, MODEL_SOURCE_FALLBACK):
+            raise ValueError(f"Unsupported model cache source: {source}")
         async with self._lock:
             logger.info(f"Updating model cache. Found {len(models_data)} models.")
             self._cache = {model["modelId"]: model for model in models_data}
             self._last_update = time.time()
+            self._source = source
     
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -170,6 +187,24 @@ class ModelInfoCache:
             List of model IDs
         """
         return list(self._cache.keys())
+
+    def get_model_entries(self, include_hidden: bool = True) -> List[Dict[str, Any]]:
+        """Return cached model records for catalog construction.
+
+        Args:
+            include_hidden: Whether manually added hidden records are included.
+
+        Returns:
+            A shallow list of cached model records.
+        """
+        if include_hidden:
+            return list(self._cache.values())
+        return [model for model in self._cache.values() if not model.get("_is_hidden")]
+
+    @property
+    def source(self) -> Optional[ModelCacheSource]:
+        """Return the evidence source of the latest cache update."""
+        return self._source
     
     @property
     def size(self) -> int:

@@ -135,23 +135,16 @@ async def get_models(request: Request):
     """
     logger.info("Request to /v1/models")
     
-    # Get available models based on mode
-    if request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
-        available_model_ids = request.app.state.account_manager.get_all_available_models()
-    else:
-        # Legacy: use resolver from first account
-        account = request.app.state.account_manager.get_first_account()
-        available_model_ids = account.model_resolver.get_available_models()
-    
-    # Build OpenAI-compatible model list
+    # The account manager owns source selection and canonicalization. This
+    # keeps aliases and fallback records out of the public catalog.
+    catalog = request.app.state.account_manager.get_model_catalog()
     openai_models = [
         OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
+            id=entry.external_model_id,
+            owned_by=entry.owned_by,
+            description=entry.description,
         )
-        for model_id in available_model_ids
+        for entry in catalog
     ]
     
     return ModelList(data=openai_models)
@@ -330,7 +323,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_id_override=(
+                        model_resolver.resolve(request_data.model).internal_id
+                        if model_resolver
+                        else None
+                    ),
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -578,7 +576,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_id_override=(
+                model_resolver.resolve(request_data.model).internal_id
+                if model_resolver
+                else None
+            ),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

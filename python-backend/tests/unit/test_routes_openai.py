@@ -363,9 +363,9 @@ class TestModelsEndpoint:
             assert model["object"] == "model", "Model object type should be 'model'"
             assert "owned_by" in model, "Model missing 'owned_by' field"
     
-    def test_models_owned_by_anthropic(self, test_client, valid_proxy_api_key):
+    def test_models_owned_by_kiro(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies models are owned by Anthropic.
+        What it does: Verifies models are owned by Kiro.
         Purpose: Ensure correct model attribution.
         """
         print("Action: GET /v1/models with valid auth...")
@@ -378,7 +378,7 @@ class TestModelsEndpoint:
         assert response.status_code == 200
         
         for model in response.json()["data"]:
-            assert model["owned_by"] == "anthropic"
+            assert model["owned_by"] == "Kiro"
 
 
 # =============================================================================

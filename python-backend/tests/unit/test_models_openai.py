@@ -62,8 +62,8 @@ class TestOpenAIModel:
         print(f"Comparing object: Expected 'model', Got '{model.object}'")
         assert model.object == "model"
         
-        print(f"Comparing owned_by: Expected 'anthropic', Got '{model.owned_by}'")
-        assert model.owned_by == "anthropic"
+        print(f"Comparing owned_by: Expected 'Kiro', Got '{model.owned_by}'")
+        assert model.owned_by == "Kiro"
         
         print(f"Comparing description: Got '{model.description}'")
         assert model.description == "Claude Sonnet 4.5 model"
@@ -93,16 +93,16 @@ class TestOpenAIModel:
         print(f"Comparing object: Expected 'model', Got '{model.object}'")
         assert model.object == "model"
     
-    def test_owned_by_defaults_to_anthropic(self):
+    def test_owned_by_defaults_to_kiro(self):
         """
-        What it does: Verifies that owned_by defaults to "anthropic".
+        What it does: Verifies that owned_by defaults to "Kiro".
         Purpose: Ensure default value is set correctly.
         """
         print("Setup: Creating OpenAIModel without explicit owned_by...")
         model = OpenAIModel(id="test-model")
         
-        print(f"Comparing owned_by: Expected 'anthropic', Got '{model.owned_by}'")
-        assert model.owned_by == "anthropic"
+        print(f"Comparing owned_by: Expected 'Kiro', Got '{model.owned_by}'")
+        assert model.owned_by == "Kiro"
     
     def test_created_is_auto_generated(self):
         """

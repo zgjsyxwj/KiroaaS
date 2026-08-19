@@ -40,7 +40,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -62,6 +62,62 @@ from kiro.config import (
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
+from kiro.model_catalog import (
+    MODEL_SOURCE_FALLBACK,
+    MODEL_SOURCE_DYNAMIC,
+    ModelCatalogEntry,
+    ModelSource,
+    build_model_catalog,
+)
+
+
+def _get_model_records(models_data: object) -> Optional[List[Dict[str, Any]]]:
+    """Extract usable model records from an untyped discovery response.
+
+    Args:
+        models_data: Parsed response value from the discovery endpoint.
+
+    Returns:
+        Valid model dictionaries, or ``None`` when no usable records exist.
+    """
+    if not isinstance(models_data, list):
+        return None
+    records = [
+        model
+        for model in models_data
+        if isinstance(model, dict)
+        and isinstance(model.get("modelId"), str)
+        and bool(model["modelId"].strip())
+    ]
+    return records or None
+
+
+def _has_model_records(models_data: object) -> bool:
+    """Return whether a discovery response contains usable model records.
+
+    Args:
+        models_data: Parsed response value from the discovery endpoint.
+
+    Returns:
+        ``True`` when at least one record has a non-empty ``modelId``.
+    """
+    return _get_model_records(models_data) is not None
+
+
+def _get_model_records_from_response(
+    response_data: object,
+) -> Optional[List[Dict[str, Any]]]:
+    """Extract model records from a parsed discovery response.
+
+    Args:
+        response_data: Parsed JSON response from the discovery endpoint.
+
+    Returns:
+        Usable model dictionaries, or ``None`` for an invalid response shape.
+    """
+    if not isinstance(response_data, dict):
+        return None
+    return _get_model_records(response_data.get("models"))
 
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
@@ -266,7 +322,7 @@ class AccountManager:
                 self._accounts[account_id] = Account(id=account_id)
                 logger.debug(f"Added account: {account_id}")
                 continue  # Skip path processing for refresh_token
-            
+
             # Handle folder scanning for json/sqlite types
             expanded_path = Path(path).expanduser()
             if expanded_path.is_dir():
@@ -497,12 +553,14 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Determine if we should fetch models or use static list
+            # Determine if we should fetch models or use the curated fallback.
+            models_list: List[Dict[str, Any]]
+            models_source: ModelSource = MODEL_SOURCE_FALLBACK
             if _is_runtime_endpoint(auth_manager):
                 # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
                 # Use static list without attempting request
                 logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
+                models_list = [dict(model) for model in FALLBACK_MODELS]
             else:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
@@ -526,7 +584,11 @@ class AccountManager:
                     
                     if response.status_code == 200:
                         data = response.json()
-                        models_list = data.get("models", [])
+                        candidate_models = _get_model_records_from_response(data)
+                        if candidate_models is None:
+                            raise ValueError("ListAvailableModels returned no usable model records")
+                        models_list = candidate_models
+                        models_source = MODEL_SOURCE_DYNAMIC
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
                         raise Exception(f"HTTP {response.status_code}")
@@ -542,7 +604,7 @@ class AccountManager:
             
             # Create model cache and update
             model_cache = ModelInfoCache()
-            await model_cache.update(models_list)
+            await model_cache.update(models_list, source=models_source)
             
             # Add hidden models
             for display_name, internal_id in HIDDEN_MODELS.items():
@@ -586,7 +648,7 @@ class AccountManager:
             account_id: Account ID to refresh
         """
         account = self._accounts.get(account_id)
-        if not account or not account.auth_manager:
+        if not account or not account.auth_manager or not account.model_cache or not account.model_resolver:
             return
         
         # Check if using runtime endpoint (no dynamic model list available)
@@ -594,7 +656,7 @@ class AccountManager:
             # Runtime endpoint does not provide /ListAvailableModels
             # Use static list and update cache timestamp
             logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
+            await account.model_cache.update(FALLBACK_MODELS, source=MODEL_SOURCE_FALLBACK)
             account.models_cached_at = time.time()
             self._dirty = True
             return
@@ -620,8 +682,10 @@ class AccountManager:
             
             if response.status_code == 200:
                 data = response.json()
-                models_list = data.get("models", [])
-                await account.model_cache.update(models_list)
+                models_list = _get_model_records_from_response(data)
+                if models_list is None:
+                    raise ValueError("ListAvailableModels returned no usable model records")
+                await account.model_cache.update(models_list, source=MODEL_SOURCE_DYNAMIC)
                 account.models_cached_at = time.time()
                 
                 # Update model_to_accounts mapping (new models may have appeared)
@@ -895,3 +959,44 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+
+    def get_model_catalog(self) -> List[ModelCatalogEntry]:
+        """Build the public catalog from dynamic evidence or curated fallback.
+
+        Dynamic records from every initialized account are merged when at least
+        one account has usable discovery evidence. Fallback records from other
+        accounts are deliberately excluded in that case.
+
+        Returns:
+            Canonical, deduplicated model catalog entries.
+        """
+        discovered_models: List[Dict[str, Any]] = []
+        discovery_available = False
+
+        for account in self._accounts.values():
+            if not account.model_cache or account.model_cache.source != MODEL_SOURCE_DYNAMIC:
+                continue
+            if account.model_cache.is_stale():
+                logger.debug(f"Skipping stale dynamic model evidence for account {account.id}")
+                continue
+            account_models = account.model_cache.get_model_entries(include_hidden=False)
+            if not _has_model_records(account_models):
+                continue
+            discovery_available = True
+            discovered_models.extend(account_models)
+
+        if discovery_available:
+            logger.info(
+                f"Building Model Catalog from dynamic account evidence ({len(discovered_models)} records)"
+            )
+        else:
+            logger.info("Dynamic model discovery unavailable; building Model Catalog from Curated Fallback")
+
+        return build_model_catalog(
+            discovered_models,
+            FALLBACK_MODELS,
+            discovery_available=discovery_available,
+            aliases=MODEL_ALIASES,
+            hidden_models=HIDDEN_MODELS,
+            hidden_from_list=HIDDEN_FROM_LIST,
+        )
