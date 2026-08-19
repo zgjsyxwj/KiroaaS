@@ -27,6 +27,7 @@ Contains classes and functions for:
 - Content deduplication
 """
 
+import codecs
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -251,6 +252,9 @@ class AwsEventStreamParser:
     def __init__(self):
         """Initializes the parser."""
         self.buffer = ""
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="ignore"
+        )
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
@@ -266,8 +270,11 @@ class AwsEventStreamParser:
             List of events in {"type": str, "data": Any} format
         """
         try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
-        except Exception:
+            # HTTP chunks are transport boundaries, not character boundaries.
+            # Keep incomplete UTF-8 sequences in the incremental decoder so
+            # content is not silently lost when Kiro splits a code point.
+            self.buffer += self._utf8_decoder.decode(chunk, final=False)
+        except (UnicodeError, TypeError):
             return []
         
         events = []
