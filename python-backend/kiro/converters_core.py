@@ -1031,22 +1031,14 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
         # Check if this message has tool_results
         if msg.tool_results:
             # Check if the previous message is an assistant with tool_calls
-            has_preceding_assistant = bool(
-                result
-                and (
-                    (
-                        result[-1].role == "assistant"
-                        and result[-1].tool_calls
-                    )
-                    or (
-                        result[-1].role == "user"
-                        and result[-1].tool_results
-                        and len(result) > 1
-                        and result[-2].role == "assistant"
-                        and result[-2].tool_calls
-                    )
+            has_preceding_assistant = False
+            for previous in reversed(result):
+                if previous.role == "user" and previous.tool_results:
+                    continue
+                has_preceding_assistant = bool(
+                    previous.role == "assistant" and previous.tool_calls
                 )
-            )
+                break
             
             if not has_preceding_assistant:
                 # We cannot create a valid synthetic assistant message because we don't know

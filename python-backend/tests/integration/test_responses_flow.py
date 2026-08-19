@@ -4,7 +4,7 @@
 
 import json
 import struct
-from typing import AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Optional
 import httpx
 import zlib
 
@@ -32,6 +32,13 @@ class KiroResponsesTransport(httpx.AsyncBaseTransport):
         error_body: bytes = b"",
         event_batches: Optional[List[List[dict]]] = None,
     ) -> None:
+        """Initialize an isolated Kiro response transport.
+
+        Args:
+            status_code: HTTP status returned by the upstream stub.
+            error_body: Optional body returned for a non-success status.
+            event_batches: Ordered AWS event batches, one batch per request.
+        """
         self.payload: Optional[dict] = None
         self.payloads: List[dict] = []
         self.status_code = status_code
@@ -116,6 +123,17 @@ def _aws_event_frame(payload: dict) -> bytes:
     prelude_crc = struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
     message = prelude + prelude_crc + headers + payload_bytes
     return message + struct.pack(">I", zlib.crc32(message) & 0xFFFFFFFF)
+
+
+def _patch_kiro_client(monkeypatch: Any, transport: KiroResponsesTransport) -> None:
+    """Route request-scoped Kiro clients to one isolated transport."""
+    import kiro.http_client
+
+    def make_stub_client(**kwargs: Any) -> httpx.AsyncClient:
+        """Build one request-scoped client for the supplied transport."""
+        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
+
+    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
 
 
 def test_authenticated_responses_flow_uses_kiro_stub_and_formal_output(
@@ -433,11 +451,11 @@ def test_responses_high_level_seam_returns_validation_error_for_malformed_input(
 
 
 def test_responses_client_tool_loop_preserves_call_id_and_sanitizes_schema(
-    test_client,
-    clean_app,
-    valid_proxy_api_key,
-    monkeypatch,
-):
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
     """A client tool call can be replayed with its result through the HTTP seam."""
     from main import app
 
@@ -455,13 +473,7 @@ def test_responses_client_tool_loop_preserves_call_id_and_sanitizes_schema(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
 
     tool = {
@@ -533,11 +545,11 @@ def test_responses_client_tool_loop_preserves_call_id_and_sanitizes_schema(
 
 
 def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
-    test_client,
-    clean_app,
-    valid_proxy_api_key,
-    monkeypatch,
-):
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
     """Parallel Tool Calls retain independent IDs and client result order."""
     from main import app
 
@@ -556,18 +568,18 @@ def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
                     "input": '{"city":"Taipei"}',
                     "stop": True,
                 },
+                {
+                    "name": "lookup_language",
+                    "toolUseId": "call-language",
+                    "input": '{"city":"Taipei"}',
+                    "stop": True,
+                },
             ],
             [{"content": "Both results received."}],
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     tools = [
         {
@@ -580,6 +592,11 @@ def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
             "name": "lookup_timezone",
             "parameters": {"type": "object"},
         },
+        {
+            "type": "function",
+            "name": "lookup_language",
+            "parameters": {"type": "object"},
+        },
     ]
 
     first_response = test_client.post(
@@ -589,8 +606,16 @@ def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
     )
     assert first_response.status_code == 200
     calls = first_response.json()["output"]
-    assert [item["call_id"] for item in calls] == ["call-city", "call-timezone"]
-    assert [item["name"] for item in calls] == ["lookup_city", "lookup_timezone"]
+    assert [item["call_id"] for item in calls] == [
+        "call-city",
+        "call-timezone",
+        "call-language",
+    ]
+    assert [item["name"] for item in calls] == [
+        "lookup_city",
+        "lookup_timezone",
+        "lookup_language",
+    ]
 
     replay_input = [
         {"type": "message", "role": "user", "content": "Look these up."},
@@ -607,9 +632,20 @@ def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
             "arguments": '{"city":"Taipei"}',
         },
         {
+            "type": "function_call",
+            "call_id": "call-language",
+            "name": "lookup_language",
+            "arguments": '{"city":"Taipei"}',
+        },
+        {
             "type": "function_call_output",
             "call_id": "call-timezone",
             "output": "UTC+8",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-language",
+            "output": "Mandarin",
         },
         {
             "type": "function_call_output",
@@ -631,16 +667,17 @@ def test_responses_multiple_client_tool_calls_keep_order_and_pair_results(
     replay_results = replay_current["userInputMessageContext"]["toolResults"]
     assert [item["toolUseId"] for item in replay_results] == [
         "call-timezone",
+        "call-language",
         "call-city",
     ]
 
 
 def test_responses_missing_kiro_call_ids_are_request_scoped_and_ordered(
-    test_client,
-    clean_app,
-    valid_proxy_api_key,
-    monkeypatch,
-):
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
     """Missing upstream IDs receive unique IDs stable within one response only."""
     from main import app
 
@@ -654,13 +691,7 @@ def test_responses_missing_kiro_call_ids_are_request_scoped_and_ordered(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     request = {
         "model": "model",
@@ -690,11 +721,11 @@ def test_responses_missing_kiro_call_ids_are_request_scoped_and_ordered(
 
 
 def test_responses_text_and_tool_output_items_keep_stable_order(
-    test_client,
-    clean_app,
-    valid_proxy_api_key,
-    monkeypatch,
-):
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
     """Mixed Kiro text and Tool Call output uses response array order."""
     from main import app
 
@@ -713,13 +744,7 @@ def test_responses_text_and_tool_output_items_keep_stable_order(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",
@@ -739,11 +764,11 @@ def test_responses_text_and_tool_output_items_keep_stable_order(
 
 
 def test_responses_rejects_duplicate_kiro_tool_call_ids_actionably(
-    test_client,
-    clean_app,
-    valid_proxy_api_key,
-    monkeypatch,
-):
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
     """Duplicate upstream IDs never produce cross-wired Responses output."""
     from main import app
 
@@ -766,13 +791,7 @@ def test_responses_rejects_duplicate_kiro_tool_call_ids_actionably(
         ]
     )
 
-    def make_stub_client(**kwargs):
-        """Build the request-scoped client against the isolated transport."""
-        return REAL_ASYNC_CLIENT(transport=transport, **kwargs)
-
-    import kiro.http_client
-
-    monkeypatch.setattr(kiro.http_client.httpx, "AsyncClient", make_stub_client)
+    _patch_kiro_client(monkeypatch, transport)
     monkeypatch.setattr(app.state, "account_system", False)
     response = test_client.post(
         "/v1/responses",

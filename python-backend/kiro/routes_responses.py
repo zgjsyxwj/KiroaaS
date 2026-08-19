@@ -236,6 +236,11 @@ async def create_response(request: Request, request_data: ResponsesRequest) -> J
                     response_id=response_id,
                 )
             except ResponsesConversionError as exc:
+                logger.error(
+                    "Responses upstream Tool Call protocol error: response_id={} error={}",
+                    response_id,
+                    exc,
+                )
                 if debug_logger:
                     debug_logger.flush_on_error(502, str(exc))
                 return JSONResponse(

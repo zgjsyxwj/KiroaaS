@@ -282,6 +282,11 @@ def build_responses_object(
                 "Kiro returned truncated Tool Call arguments; retry the request "
                 "or reduce the tool input and context"
             )
+        if tool.get("_malformed_arguments"):
+            raise ResponsesConversionError(
+                "Kiro returned malformed Tool Call arguments; retry the request "
+                "or report the upstream response"
+            )
         call_id = tool.get("id")
         if tool.get("_generated_id") or not call_id:
             call_id = _new_request_scoped_call_id(

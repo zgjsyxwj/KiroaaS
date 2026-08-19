@@ -453,6 +453,7 @@ class AwsEventStreamParser:
                     else:
                         # Regular JSON parse error
                         logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
+                        self.current_tool_call["_malformed_arguments"] = True
                     
                     self.current_tool_call['function']['arguments'] = "{}"
             else:
@@ -565,7 +566,10 @@ class AwsEventStreamParser:
         Finalizes current tool call if not finished.
         Removes duplicates by default. Responses can disable this because
         identical parallel Client Tools still represent independent calls.
-        
+
+        Args:
+            deduplicate: Whether to remove duplicate calls.
+
         Returns:
             List of collected tool calls, optionally deduplicated
         """

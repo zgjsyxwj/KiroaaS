@@ -131,6 +131,8 @@ async def parse_kiro_stream(
         response: HTTP response with data stream
         first_token_timeout: First token wait timeout (seconds)
         enable_thinking_parser: Whether to enable thinking block parsing
+        deduplicate_result_tool_calls: Whether to preserve duplicate tool
+            calls instead of applying the legacy parser deduplication.
     
     Yields:
         KiroEvent objects representing stream events
@@ -305,6 +307,8 @@ async def collect_stream_to_result(
         response: HTTP response with stream
         first_token_timeout: First token wait timeout
         enable_thinking_parser: Whether to enable thinking block parsing
+        deduplicate_result_tool_calls: Whether to preserve duplicate tool
+            calls instead of applying the legacy parser deduplication.
     
     Returns:
         StreamResult with full content, thinking, tool calls, and usage

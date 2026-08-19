@@ -569,6 +569,8 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
     if not items:
         raise ResponsesConversionError("input must contain at least one item")
 
+    response_tools = _convert_tools(request.tools)
+    registered_tool_names = {tool.name for tool in response_tools}
     known_call_ids = set()
     returned_call_ids = set()
     for item in items:
@@ -576,6 +578,12 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
             if item.call_id in known_call_ids:
                 raise ResponsesConversionError(
                     f"Duplicate function_call call_id: {item.call_id}"
+                )
+            call_name = item.tool_calls[0]["function"]["name"]
+            if registered_tool_names and call_name not in registered_tool_names:
+                raise ResponsesConversionError(
+                    f"function_call '{item.call_id}' references unregistered tool "
+                    f"'{call_name}'; resend its function definition in tools"
                 )
             known_call_ids.add(item.call_id)
         elif item.item_type == "function_call_output":
@@ -590,6 +598,13 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
                     f"{item.call_id}; send exactly one result for each Tool Call"
                 )
             returned_call_ids.add(item.call_id)
+    missing_results = known_call_ids - returned_call_ids
+    if missing_results:
+        missing = ", ".join(sorted(missing_results))
+        raise ResponsesConversionError(
+            "function_call items are missing matching function_call_output items: "
+            f"{missing}"
+        )
 
     instruction_segments: List[str] = []
     instructions_text = _extract_instruction_text(request.instructions, "instructions")
@@ -647,7 +662,6 @@ def convert_responses_request(request: ResponsesRequest) -> ResponsesRequestIR:
     if not messages:
         raise ResponsesConversionError("input must contain a user or assistant message")
 
-    response_tools = _convert_tools(request.tools)
     logger.debug(
         "Responses IR: model={}, items={}, messages={}, tools={}, instruction_segments={} "
         "(instruction hierarchy is best-effort)",

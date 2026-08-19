@@ -3,6 +3,7 @@
 """Unit tests for the independent non-streaming Responses adapter."""
 
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import pytest
 
@@ -276,6 +277,21 @@ def test_responses_rejects_orphaned_tool_result_and_unimplemented_controls():
             )
         )
 
+    with pytest.raises(ResponsesConversionError, match="missing matching"):
+        convert_responses_request(
+            ResponsesRequest(
+                model="model",
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_unanswered",
+                        "name": "run",
+                        "arguments": "{}",
+                    }
+                ],
+            )
+        )
+
     with pytest.raises(ResponsesConversionError, match="base64"):
         convert_responses_request(
             ResponsesRequest(
@@ -375,6 +391,54 @@ def test_responses_output_omits_empty_message_and_preserves_tool_call_ids():
     assert body["usage"]["input_tokens"] > 0
     assert body["usage"]["output_tokens"] > 0
     assert body["usage"]["total_tokens"] > 0
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "error_text"),
+    [
+        (
+            {
+                "id": "call_bad",
+                "type": "function",
+                "function": {"name": "run", "arguments": "not-json"},
+            },
+            "malformed arguments",
+        ),
+        (
+            {
+                "id": "call_missing_name",
+                "type": "function",
+                "function": {"arguments": "{}"},
+            },
+            "without a function name",
+        ),
+        (
+            {
+                "id": "call_truncated",
+                "type": "function",
+                "_truncation_detected": True,
+                "function": {"name": "run", "arguments": "{}"},
+            },
+            "truncated",
+        ),
+    ],
+)
+def test_responses_output_rejects_malformed_kiro_tool_calls(
+    tool_call: Dict[str, Any],
+    error_text: str,
+) -> None:
+    """Malformed upstream Tool Calls fail instead of becoming valid output."""
+    request = ResponsesRequest(model="model", input="run")
+    request_ir = convert_responses_request(request)
+
+    with pytest.raises(ResponsesConversionError, match=error_text):
+        build_responses_object(
+            request,
+            request_ir,
+            StreamResult(tool_calls=[tool_call]),
+            model_cache=None,
+            response_id="resp_malformed",
+        )
 
 
 def test_responses_usage_uses_kiro_context_percentage_when_available():
