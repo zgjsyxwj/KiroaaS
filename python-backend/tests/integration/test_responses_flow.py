@@ -411,6 +411,440 @@ def test_responses_stream_preserves_function_call_lifecycle_and_call_id(
     assert events[4]["item"]["status"] == "completed"
 
 
+def test_responses_stream_preserves_all_client_tool_lifecycles_and_semantics(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
+    """Streaming keeps each Client Tool item independent and typed.
+
+    What it does: Streams text frames alongside every supported Client Tool.
+    Purpose: Verify the parser's stable text-before-atomic-tool order, complete
+        item lifecycles, fields, indexes, and IDs without cross-wiring items.
+    """
+    from main import app
+
+    event_batches = [
+        [
+            {"content": "before"},
+            {
+                "name": "freeform",
+                "toolUseId": "call-custom",
+                "input": '{"input":"raw input"}',
+                "stop": True,
+            },
+            {"content": "between"},
+            {
+                "name": "shell",
+                "toolUseId": "call-shell",
+                "input": '{"commands":["pwd"]}',
+                "stop": True,
+            },
+            {
+                "name": "local_shell",
+                "toolUseId": "call-local-shell",
+                "input": '{"command":["pwd"],"env":{}}',
+                "stop": True,
+            },
+            {
+                "name": "tool_search",
+                "toolUseId": "call-search",
+                "input": '{"query":"browser"}',
+                "stop": True,
+            },
+            {
+                "name": "apply_patch",
+                "toolUseId": "call-apply-patch",
+                "input": '{"type":"update_file","path":"a.txt","diff":"@@"}',
+                "stop": True,
+            },
+            {
+                "name": "lookup",
+                "toolUseId": "call-function",
+                "input": '{"city":"Taipei"}',
+                "stop": True,
+            },
+            {"content": "after"},
+        ]
+    ]
+    transport = KiroResponsesTransport(event_batches=event_batches)
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+    tools = [
+        {"type": "custom", "name": "freeform"},
+        {"type": "shell"},
+        {"type": "local_shell"},
+        {"type": "tool_search", "execution": "client"},
+        {"type": "apply_patch"},
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+    ]
+    request = {
+        "model": "model",
+        "input": "Use the tools.",
+        "stream": True,
+        "tools": tools,
+    }
+
+    stream_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json=request,
+    )
+    events = _parse_response_sse(stream_response.content)
+
+    assert stream_response.status_code == 200
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.completed"
+
+    added = {
+        event["item"]["call_id"]: event
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and "call_id" in event["item"]
+    }
+    done = {
+        event["item"]["call_id"]: event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and "call_id" in event["item"]
+    }
+    expected_call_ids = [
+        "call-custom",
+        "call-shell",
+        "call-local-shell",
+        "call-search",
+        "call-apply-patch",
+        "call-function",
+    ]
+    assert list(added) == expected_call_ids
+    assert list(done) == expected_call_ids
+    assert len({event["item"]["id"] for event in added.values()}) == len(expected_call_ids)
+    assert [event["output_index"] for event in added.values()] == [1, 2, 3, 4, 5, 6]
+    assert all(event["item"]["status"] == "in_progress" for event in added.values())
+    assert all(event["item"]["status"] == "completed" for event in done.values())
+    assert all(
+        added[call_id]["item"]["id"] == done[call_id]["item"]["id"]
+        for call_id in expected_call_ids
+    )
+    message_added = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "message"
+    )
+    message_done = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "message"
+    )
+    assert message_added["output_index"] == 0
+    assert message_added["item"]["status"] == "in_progress"
+    assert message_added["item"]["content"] == []
+    assert message_done["output_index"] == 0
+    assert message_done["item"]["id"] == message_added["item"]["id"]
+    assert message_done["item"]["status"] == "completed"
+    assert message_done["item"]["content"][0]["text"] == "beforebetweenafter"
+    content_part_added = [
+        event for event in events if event["type"] == "response.content_part.added"
+    ]
+    content_part_done = [
+        event for event in events if event["type"] == "response.content_part.done"
+    ]
+    text_deltas = [
+        event for event in events if event["type"] == "response.output_text.delta"
+    ]
+    assert len(content_part_added) == 1
+    assert len(content_part_done) == 1
+    assert [event["delta"] for event in text_deltas] == ["before", "between", "after"]
+    assert content_part_added[0]["item_id"] == message_added["item"]["id"]
+    assert content_part_done[0]["item_id"] == message_done["item"]["id"]
+
+    custom_deltas = [
+        event
+        for event in events
+        if event["type"] == "response.custom_tool_call_input.delta"
+    ]
+    custom_dones = [
+        event
+        for event in events
+        if event["type"] == "response.custom_tool_call_input.done"
+    ]
+    assert len(custom_deltas) == 1
+    assert len(custom_dones) == 1
+    custom_delta = custom_deltas[0]
+    custom_done = custom_dones[0]
+    assert custom_delta["item_id"] == added["call-custom"]["item"]["id"]
+    assert custom_delta["output_index"] == 1
+    assert custom_delta["delta"] == "raw input"
+    assert custom_done["item_id"] == custom_delta["item_id"]
+    assert custom_done["output_index"] == custom_delta["output_index"]
+    assert custom_done["input"] == "raw input"
+
+    function_deltas = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.delta"
+    ]
+    function_dones = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.done"
+    ]
+    assert len(function_deltas) == 1
+    assert len(function_dones) == 1
+    function_delta = function_deltas[0]
+    function_done = function_dones[0]
+    assert function_delta["item_id"] == added["call-function"]["item"]["id"]
+    assert function_delta["output_index"] == 6
+    assert function_delta["delta"] == '{"city": "Taipei"}'
+    assert function_done["item_id"] == function_delta["item_id"]
+    assert function_done["output_index"] == function_delta["output_index"]
+    assert function_done["name"] == "lookup"
+    assert function_done["arguments"] == function_delta["delta"]
+
+    stream_tools = {
+        item["call_id"]: item
+        for item in events[-1]["response"]["output"]
+        if "call_id" in item
+    }
+    assert stream_tools["call-custom"]["input"] == "raw input"
+    assert stream_tools["call-shell"]["action"] == {"commands": ["pwd"]}
+    assert stream_tools["call-local-shell"]["action"] == {
+        "command": ["pwd"],
+        "env": {},
+    }
+    assert stream_tools["call-search"]["arguments"] == {"query": "browser"}
+    assert stream_tools["call-apply-patch"]["operation"] == {
+        "type": "update_file",
+        "path": "a.txt",
+        "diff": "@@",
+    }
+    assert stream_tools["call-function"]["arguments"] == '{"city": "Taipei"}'
+
+    non_streaming_response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={**request, "stream": False},
+    )
+    assert non_streaming_response.status_code == 200
+    non_streaming_tools = {
+        item["call_id"]: item
+        for item in non_streaming_response.json()["output"]
+        if "call_id" in item
+    }
+    for call_id in expected_call_ids:
+        assert {
+            key: stream_tools[call_id][key]
+            for key in stream_tools[call_id]
+            if key not in {"id", "status"}
+        } == {
+            key: non_streaming_tools[call_id][key]
+            for key in non_streaming_tools[call_id]
+            if key not in {"id", "status"}
+        }
+
+
+@pytest.mark.parametrize(
+    ("event", "message_fragment"),
+    [
+        (
+            {
+                "name": "run",
+                "toolUseId": "call-malformed",
+                "input": "not-json",
+                "stop": True,
+            },
+            "malformed",
+        ),
+        (
+            {
+                "name": "run",
+                "toolUseId": "call-truncated",
+                "input": '{"n":',
+                "stop": True,
+            },
+            "truncated",
+        ),
+        (
+            {"name": "run", "input": "{}", "stop": True},
+            "call_id",
+        ),
+    ],
+)
+def test_responses_stream_turns_malformed_or_missing_tool_identity_into_one_failure(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+    event: Dict[str, Any],
+    message_fragment: str,
+) -> None:
+    """Malformed streamed Tool Calls terminate once without a false completion."""
+    from main import app
+
+    transport = KiroResponsesTransport(event_batches=[[event]])
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": "Run it.",
+            "stream": True,
+            "tools": [{"type": "function", "name": "run", "parameters": {}}],
+        },
+    )
+
+    events = _parse_response_sse(response.content)
+    assert response.status_code == 200
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.failed"
+    assert [event["type"] for event in events].count("response.failed") == 1
+    assert [event["type"] for event in events].count("response.completed") == 0
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert message_fragment in events[-1]["response"]["error"]["message"].lower()
+
+
+def test_responses_stream_keeps_parallel_same_name_calls_independent(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
+    """Parallel calls keep call IDs, item IDs, indexes, and arguments isolated."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "run",
+                    "toolUseId": "call-one",
+                    "input": '{"n":1}',
+                    "stop": True,
+                },
+                {
+                    "name": "run",
+                    "toolUseId": "call-two",
+                    "input": '{"n":2}',
+                    "stop": True,
+                },
+            ]
+        ]
+    )
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": "Run both.",
+            "stream": True,
+            "tools": [{"type": "function", "name": "run", "parameters": {}}],
+        },
+    )
+
+    events = _parse_response_sse(response.content)
+    added = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and "call_id" in event["item"]
+    ]
+    done = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and "call_id" in event["item"]
+    ]
+    deltas = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.delta"
+    ]
+
+    assert response.status_code == 200
+    assert [event["item"]["call_id"] for event in added] == ["call-one", "call-two"]
+    assert [event["item"]["call_id"] for event in done] == ["call-one", "call-two"]
+    assert [event["output_index"] for event in added] == [0, 1]
+    assert [event["delta"] for event in deltas] == ['{"n": 1}', '{"n": 2}']
+    argument_dones = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.done"
+    ]
+    assert len(deltas) == 2
+    assert len(argument_dones) == 2
+    assert [event["item_id"] for event in argument_dones] == [
+        event["item"]["id"] for event in done
+    ]
+    assert [event["item"]["id"] for event in added] == [
+        event["item"]["id"] for event in done
+    ]
+    assert events[-1]["type"] == "response.completed"
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+
+
+def test_responses_stream_rejects_replayed_call_id_from_new_tool_call(
+    test_client: Any,
+    clean_app: Any,
+    valid_proxy_api_key: str,
+    monkeypatch: Any,
+) -> None:
+    """A new streamed Tool Call cannot reuse a replayed completed call ID."""
+    from main import app
+
+    transport = KiroResponsesTransport(
+        event_batches=[
+            [
+                {
+                    "name": "run",
+                    "toolUseId": "call-replayed",
+                    "input": '{"n":2}',
+                    "stop": True,
+                }
+            ]
+        ]
+    )
+    _patch_kiro_client(monkeypatch, transport)
+    monkeypatch.setattr(app.state, "account_system", False)
+    response = test_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+        json={
+            "model": "model",
+            "input": [
+                {"type": "message", "role": "user", "content": "Run it twice."},
+                {
+                    "type": "function_call",
+                    "call_id": "call-replayed",
+                    "name": "run",
+                    "arguments": '{"n":1}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-replayed",
+                    "output": "done",
+                },
+            ],
+            "stream": True,
+            "tools": [{"type": "function", "name": "run", "parameters": {}}],
+        },
+    )
+
+    events = _parse_response_sse(response.content)
+    assert response.status_code == 200
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.failed"
+    assert [event["type"] for event in events].count("response.failed") == 1
+    assert not any(event["type"] == "response.output_item.added" for event in events)
+
+
 def test_responses_stream_upstream_http_error_stays_an_ordinary_http_error(
     test_client,
     clean_app,

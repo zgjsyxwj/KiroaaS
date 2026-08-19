@@ -15,7 +15,6 @@ from kiro.models_responses import ResponsesRequest
 from kiro.responses_provider import (
     _build_client_tool_output,
     _new_item_id,
-    _new_request_scoped_call_id,
     _parse_kiro_tool_arguments,
     estimate_responses_usage,
 )
@@ -48,10 +47,14 @@ class ResponsesStreamState:
     _next_output_index: int = 0
     _text_item: Optional[Dict[str, Any]] = None
     _text_output_index: Optional[int] = None
-    _tool_items: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _seen_call_ids: set[str] = field(default_factory=set)
     _result: StreamResult = field(default_factory=StreamResult)
     _created: bool = False
     _terminal: bool = False
+
+    def __post_init__(self) -> None:
+        """Seed response-local identity checks with replayed Tool Calls."""
+        self._seen_call_ids.update(self.request_ir.tool_registry.by_call_id)
 
     def created_event(self) -> Dict[str, Any]:
         """Return the single first event that establishes response identity.
@@ -96,8 +99,8 @@ class ResponsesStreamState:
         if event.type == "context_usage" and event.context_usage_percentage is not None:
             self._result.context_usage_percentage = event.context_usage_percentage
             return []
-        if event.type == "tool_use" and event.tool_use:
-            return self._consume_tool(event.tool_use)
+        if event.type == "tool_use":
+            return self._consume_tool(event.tool_use or {})
         return []
 
     def complete(self) -> List[Dict[str, Any]]:
@@ -274,7 +277,19 @@ class ResponsesStreamState:
         Raises:
             ResponsesConversionError: If tool identity or arguments are invalid.
         """
+        if tool.get("_truncation_detected"):
+            raise ResponsesConversionError(
+                "Kiro returned truncated Tool Call arguments; retry the request "
+                "or reduce the tool input and context"
+            )
+        if tool.get("_malformed_arguments"):
+            raise ResponsesConversionError(
+                "Kiro returned malformed Tool Call arguments; retry the request "
+                "or report the upstream response"
+            )
         function = tool.get("function") or {}
+        if not isinstance(function, dict):
+            raise ResponsesConversionError("Kiro returned malformed Tool Call data")
         name = function.get("name") or tool.get("name")
         if not isinstance(name, str) or not name:
             raise ResponsesConversionError("Kiro returned a Tool Call without a function name")
@@ -285,10 +300,10 @@ class ResponsesStreamState:
             raise ResponsesConversionError("Kiro returned malformed Tool Call arguments")
         call_id = tool.get("id")
         if tool.get("_generated_id") or not isinstance(call_id, str) or not call_id:
-            call_id = _new_request_scoped_call_id(
-                self.response_id, self._next_output_index, set(self._tool_items)
+            raise ResponsesConversionError(
+                "Kiro returned a Tool Call without a usable call_id"
             )
-        if call_id in self._tool_items:
+        if call_id in self._seen_call_ids:
             raise ResponsesConversionError(
                 f"Kiro returned duplicate Tool Call call_id '{call_id}'"
             )
@@ -311,7 +326,7 @@ class ResponsesStreamState:
         elif item["type"] == "custom_tool_call":
             item["input"] = ""
         self._output.append(item)
-        self._tool_items[call_id] = item
+        self._seen_call_ids.add(call_id)
         self._result.tool_calls.append(tool)
         events = [
             *self._finish_text(),
@@ -334,7 +349,26 @@ class ResponsesStreamState:
                         "response.function_call_arguments.done",
                         item_id=item_id,
                         output_index=output_index,
+                        name=name,
                         arguments=arguments,
+                    ),
+                ]
+            )
+        elif item["type"] == "custom_tool_call":
+            custom_input = parsed_arguments["input"]
+            events.extend(
+                [
+                    self._event(
+                        "response.custom_tool_call_input.delta",
+                        item_id=item_id,
+                        output_index=output_index,
+                        delta=custom_input,
+                    ),
+                    self._event(
+                        "response.custom_tool_call_input.done",
+                        item_id=item_id,
+                        output_index=output_index,
+                        input=custom_input,
                     ),
                 ]
             )
