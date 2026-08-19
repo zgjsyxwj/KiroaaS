@@ -107,6 +107,12 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_PRIVATE_KEY)) {
             Remove-Item Env:TAURI_PRIVATE_KEY -ErrorAction SilentlyContinue
             Remove-Item Env:TAURI_KEY_PASSWORD -ErrorAction SilentlyContinue
+
+            $configPath = "src-tauri/tauri.conf.json"
+            $config = Get-Content $configPath -Raw | ConvertFrom-Json
+            $config.tauri.updater.active = $false
+            $config | ConvertTo-Json -Depth 100 | Set-Content $configPath -Encoding utf8
+            Write-Host "Updater artifacts are disabled because no updater signing key is configured."
           }
           ./build-windows.ps1
 
